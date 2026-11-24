@@ -10,6 +10,9 @@ const baseUrl = req('PUBLIC_BASE_URL').replace(/\/+$/, '');
 if (!baseUrl.startsWith('https://')) {
   console.warn(`[warn] PUBLIC_BASE_URL が https ではありません: ${baseUrl}`);
 }
+if (baseUrl.endsWith('/')) {
+  console.warn('[warn] PUBLIC_BASE_URL の末尾スラッシュを除去しました');
+}
 
 export const config = {
   token: req('DISCORD_TOKEN'),
