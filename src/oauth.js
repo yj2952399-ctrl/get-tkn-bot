@@ -9,7 +9,7 @@ export function authorizeUrl(state) {
     state,
     prompt: 'consent'
   });
-  return `https://discord.com/oauth2/authorize?${p}`;
+  return `https://discord.com/oauth2/authorize?${p.toString()}`;
 }
 
 export async function exchangeCode(code) {
