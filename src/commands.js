@@ -11,6 +11,31 @@ import { config } from './config.js';
 import { store, save } from './store.js';
 import { rand } from './util.js';
 
+/* --- オプション値の正規化 ---------------------------------------------
+   環境によっては options.get() が生のオプション({name,type,value})を返すため、
+   値だけを取り出して文字列/ID として扱えるようにする。
+   ------------------------------------------------------------------- */
+const unwrap = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v.value : v);
+
+const text = (v) => {
+  const x = unwrap(v);
+  if (x == null) return undefined;
+  return typeof x === 'string' ? x : String(x);
+};
+
+const idOf = (v) => {
+  const x = unwrap(v);
+  if (!x) return undefined;
+  return typeof x === 'string' ? x : (x.id ?? undefined);
+};
+
+const toColor = (v, fallback) => {
+  const s = text(v);
+  if (!s) return fallback;
+  const n = parseInt(s.replace(/^#/, ''), 16);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 function addPanelOptions(s) {
   return s
     .addChannelOption((o) =>
@@ -95,15 +120,15 @@ export const commands = [
 
 export function buildPanelMessage(panel) {
   const e = new EmbedBuilder()
-    .setTitle(panel.title || 'サーバー認証')
-    .setDescription(panel.description || '下のボタンから認証を完了してください。')
-    .setColor(panel.color || 0x5865f2);
+    .setTitle(text(panel.title) || 'サーバー認証')
+    .setDescription(text(panel.description) || '下のボタンから認証を完了してください。')
+    .setColor(Number.isFinite(panel.color) ? panel.color : 0x5865f2);
 
   const reqs = [];
   if (panel.blockProxy) reqs.push('- VPN / プロキシ / Tor 不可');
   if (panel.blockHosting) reqs.push('- データセンター回線 不可');
   if (panel.requireMobile) reqs.push('- モバイル回線のみ');
-  if (panel.minAgeDays > 0) reqs.push(`- アカウント作成から ${panel.minAgeDays} 日以上`);
+  if (Number(panel.minAgeDays) > 0) reqs.push(`- アカウント作成から ${panel.minAgeDays} 日以上`);
   if (panel.requireAvatar) reqs.push('- プロフィール画像の設定');
   if (panel.onePerIp) reqs.push('- 同一IPでの複数アカウント不可');
   if (reqs.length) e.addFields({ name: '認証条件', value: reqs.join('\n') });
@@ -117,14 +142,17 @@ export function buildPanelMessage(panel) {
 
   e.setFooter({ text: `Panel ${panel.id}` });
 
-  const btn = panel.externalUrl
+  const label = text(panel.buttonLabel) || '認証する';
+  const url = text(panel.externalUrl);
+
+  const btn = url
     ? new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
-        .setLabel(panel.buttonLabel || '認証する')
-        .setURL(panel.externalUrl)
+        .setLabel(label)
+        .setURL(url)
     : new ButtonBuilder()
         .setStyle(ButtonStyle.Success)
-        .setLabel(panel.buttonLabel || '認証する')
+        .setLabel(label)
         .setCustomId(`vp:${panel.id}`);
 
   return { embeds: [e], components: [new ActionRowBuilder().addComponents(btn)] };
@@ -132,28 +160,30 @@ export function buildPanelMessage(panel) {
 
 function collectOptions(i, base = {}) {
   const g = (n) => i.options.get(n);
-  const roles = [g('role1'), g('role2'), g('role3')].filter(Boolean).map((r) => r.id);
-  const removeRole = g('remove_role');
+
+  const roles = [g('role1'), g('role2'), g('role3')].map(idOf).filter(Boolean);
+  const removeRole = idOf(g('remove_role'));
+  const color = text(g('color'));
 
   return {
     ...base,
     roles,
-    removeRoles: removeRole ? [removeRole.id] : base.removeRoles || [],
-    title: g('title') ?? base.title,
-    description: g('description') ?? base.description,
-    buttonLabel: g('button_label') ?? base.buttonLabel,
-    color: g('color') ? parseInt(g('color').replace('#', ''), 16) : base.color,
-    externalMode: g('external_mode') ?? base.externalMode ?? false,
-    externalUrl: g('external_url') ?? base.externalUrl,
-    logChannelId: g('log_channel')?.id ?? base.logChannelId,
-    minAgeDays: g('min_age_days') ?? base.minAgeDays ?? 7,
-    requireAvatar: g('require_avatar') ?? base.requireAvatar ?? true,
-    blockProxy: g('block_proxy') ?? base.blockProxy ?? true,
-    blockHosting: g('block_hosting') ?? base.blockHosting ?? true,
-    requireMobile: g('require_mobile') ?? base.requireMobile ?? false,
-    onePerIp: g('one_per_ip') ?? base.onePerIp ?? true,
-    successMessage: g('success_message') ?? base.successMessage,
-    failureMessage: g('failure_message') ?? base.failureMessage
+    removeRoles: removeRole ? [removeRole] : base.removeRoles || [],
+    title: text(g('title')) ?? base.title,
+    description: text(g('description')) ?? base.description,
+    buttonLabel: text(g('button_label')) ?? base.buttonLabel,
+    color: toColor(color, base.color),
+    externalMode: unwrap(g('external_mode')) ?? base.externalMode ?? false,
+    externalUrl: text(g('external_url')) ?? base.externalUrl,
+    logChannelId: idOf(g('log_channel')) ?? base.logChannelId,
+    minAgeDays: unwrap(g('min_age_days')) ?? base.minAgeDays ?? 7,
+    requireAvatar: unwrap(g('require_avatar')) ?? base.requireAvatar ?? true,
+    blockProxy: unwrap(g('block_proxy')) ?? base.blockProxy ?? true,
+    blockHosting: unwrap(g('block_hosting')) ?? base.blockHosting ?? true,
+    requireMobile: unwrap(g('require_mobile')) ?? base.requireMobile ?? false,
+    onePerIp: unwrap(g('one_per_ip')) ?? base.onePerIp ?? true,
+    successMessage: text(g('success_message')) ?? base.successMessage,
+    failureMessage: text(g('failure_message')) ?? base.failureMessage
   };
 }
 
@@ -231,10 +261,10 @@ export async function handleCommand(interaction) {
       if (!list.length) {
         return interaction.reply({ content: 'パネルはありません', flags: MessageFlags.Ephemeral });
       }
-      const text = list
+      const text2 = list
         .map((p) => `\`${p.id}\` <#${p.channelId}> roles:${p.roles?.length || 0} ext:${p.externalUrl ? 'yes' : 'no'} age:${p.minAgeDays}`)
         .join('\n');
-      return interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+      return interaction.reply({ content: text2, flags: MessageFlags.Ephemeral });
     }
 
     if (sub === 'repost') {
