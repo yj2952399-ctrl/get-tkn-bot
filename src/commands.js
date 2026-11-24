@@ -46,8 +46,12 @@ export const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((s) => addPanelOptions(s.setName('create').setDescription('パネルを作成')))
     .addSubcommand((s) =>
-      addPanelOptions(s.setName('edit').setDescription('パネルを編集'))
-        .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
+      addPanelOptions(
+        s
+          .setName('edit')
+          .setDescription('パネルを編集')
+          .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
+      )
     )
     .addSubcommand((s) =>
       s.setName('delete').setDescription('パネルを削除')
