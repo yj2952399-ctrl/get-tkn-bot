@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>認証エラー</title>
+<style>
+body{background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:20px}
+.c{background:#2b2d31;padding:32px;border-radius:14px;max-width:420px;text-align:center}
+h1{color:#e74c3c;font-size:20px}
+p{font-size:14px;line-height:1.7}
+</style>
+<div class="c">
+<h1>認証できませんでした</h1>
+<p id="m">Discord に戻って、もう一度パネルからやり直してください。</p>
+</div>
+<script>
+const map = {
+  denied: 'Discord の許可がキャンセルされました。',
+  state: 'セッションの検証に失敗しました。リンクを開き直してください。',
+  used: 'この認証リンクは既に使用済みです。',
+  exchange: 'トークン交換に失敗しました。時間をおいてやり直してください。',
+  user: 'ユーザー情報を取得できませんでした。',
+  wronguser: 'リンク発行時と別のアカウントで認証されました。',
+  panel: 'パネルが削除されています。'
+};
+const e = new URLSearchParams(location.search).get('e');
+if (map[e]) document.getElementById('m').textContent = map[e];
+</script>
+</html>
