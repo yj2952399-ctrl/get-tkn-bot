@@ -50,6 +50,8 @@ export function evaluate(panel, user, ipData) {
       (v) =>
         v.guildId === panel.guildId &&
         v.ok &&
+        !v.revoked &&
+        v.userId !== user.id &&
         v.ip === ipData.ip &&
         Date.now() - new Date(v.at).getTime() < 30 * 86400000
     );
@@ -152,9 +154,48 @@ export async function logTo(client, panel, embed, files = []) {
 }
 
 export async function complete({ client, panel, user, oauth, ipData, fp, session }) {
-  const { ok, reasons, p } = evaluate(panel, user, ipData);
+  const ev = evaluate(panel, user, ipData);
+  const { reasons, p } = ev;
+  let ok = ev.ok;
+
   const guild = await client.guilds.fetch(panel.guildId).catch(() => null);
   const guildLabel = guild ? guild.name : panel.guildId;
+
+  if (ok) {
+    if (p.roles.length) {
+      let added = false;
+      let err = null;
+      try {
+        await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
+          body: { access_token: oauth.access_token, roles: p.roles }
+        });
+        added = true;
+      } catch (e) {
+        err = `${e.status || ''} ${e.message || e}`.trim();
+      }
+      if (!added) {
+        const m = await guild?.members.fetch(user.id).catch(() => null);
+        if (m) {
+          try {
+            await m.roles.add(p.roles);
+            added = true;
+          } catch (e) {
+            err = `${e.status || ''} ${e.message || e}`.trim();
+          }
+        } else {
+          err = err || 'メンバー取得失敗';
+        }
+      }
+      if (!added) {
+        ok = false;
+        reasons.push(`ロール付与失敗: ${err}`);
+      }
+    }
+    if (ok && p.removeRoles.length) {
+      const m = await guild?.members.fetch(user.id).catch(() => null);
+      if (m) await m.roles.remove(p.removeRoles).catch(() => {});
+    }
+  }
 
   const record = {
     id: session.id,
@@ -219,27 +260,10 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   ];
 
   if (!ok) {
+    const msg = ev.ok ? 'ロール付与に失敗しました。管理者に連絡してください。' : p.failureMessage;
     await logTo(client, panel, embed, file);
-    await notify(client, session, user, `❌ ${p.failureMessage}\n対象: ${guildLabel}`);
+    await notify(client, session, user, `❌ ${msg}\n対象: ${guildLabel}`);
     return { ok, reasons };
-  }
-
-  try {
-    await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
-      body: { access_token: oauth.access_token, roles: p.roles }
-    });
-  } catch {
-    const m = await guild?.members.fetch(user.id).catch(() => null);
-    if (m && p.roles.length) await m.roles.add(p.roles).catch(() => {});
-  }
-
-  if (p.roles.length) {
-    const m = await guild?.members.fetch(user.id).catch(() => null);
-    if (m) await m.roles.add(p.roles).catch(() => {});
-  }
-  if (p.removeRoles.length) {
-    const m = await guild?.members.fetch(user.id).catch(() => null);
-    if (m) await m.roles.remove(p.removeRoles).catch(() => {});
   }
 
   await logTo(client, panel, embed, file);
