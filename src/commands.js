@@ -291,6 +291,24 @@ export async function handleCommand(interaction) {
     const remove = [...new Set(panels.flatMap((p) => p.removeRoles || []))];
     if (add.length) await member.roles.add(add).catch(() => {});
     if (remove.length) await member.roles.remove(remove).catch(() => {});
+
+    store.verifications.push({
+      id: rand(24),
+      guildId: interaction.guildId,
+      userId: user.id,
+      tag: user.tag,
+      ip: null,
+      ok: true,
+      manual: true,
+      reasons: [`手動認証 (${interaction.user.tag})`],
+      at: new Date().toISOString(),
+      fp: null,
+      geo: null,
+      net: null,
+      oauth: null
+    });
+    save();
+
     return interaction.reply({ content: `${user.tag} を認証済みにしました`, flags: MessageFlags.Ephemeral });
   }
 
@@ -300,7 +318,21 @@ export async function handleCommand(interaction) {
     const panels = Object.values(store.panels).filter((p) => p.guildId === interaction.guildId);
     const add = [...new Set(panels.flatMap((p) => p.roles || []))];
     if (member && add.length) await member.roles.remove(add).catch(() => {});
-    return interaction.reply({ content: `${user.tag} の認証を解除しました`, flags: MessageFlags.Ephemeral });
+
+    let n = 0;
+    for (const v of store.verifications) {
+      if (v.userId === user.id && v.guildId === interaction.guildId && v.ok && !v.revoked) {
+        v.revoked = true;
+        v.revokedAt = new Date().toISOString();
+        n++;
+      }
+    }
+    if (n) save();
+
+    return interaction.reply({
+      content: `${user.tag} の認証を解除しました（記録 ${n} 件を解除扱い）`,
+      flags: MessageFlags.Ephemeral
+    });
   }
 
   if (commandName === 'whois') {
@@ -313,8 +345,13 @@ export async function handleCommand(interaction) {
     const r = recs[recs.length - 1];
     const e = new EmbedBuilder()
       .setTitle(user.tag)
-      .setColor(r.ok ? 0x2ecc71 : 0xe74c3c)
+      .setColor(r.revoked ? 0x95a5a6 : r.ok ? 0x2ecc71 : 0xe74c3c)
       .addFields(
+        {
+          name: '状態',
+          value: r.revoked ? `解除済み (${r.revokedAt})` : r.manual ? '手動認証' : r.ok ? '有効' : '不通過',
+          inline: true
+        },
         { name: 'IP', value: `\`${r.ip || '-'}\``, inline: true },
         { name: '地域', value: `${r.geo?.country || '?'} / ${r.geo?.city || '?'}`, inline: true },
         { name: 'ISP', value: r.net?.isp || '-', inline: true },
