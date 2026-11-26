@@ -16,17 +16,32 @@ const page = fs.readFileSync(path.join(PUBLIC, 'verify.html'), 'utf8');
 
 function bookmarklet(token) {
   const dest = `${config.baseUrl}/v/${token}/done?ok=1&ut=`;
-  const code =
-    '(function(){var t=null;' +
-    'try{window.webpackChunkdiscord_app.push([[Symbol()],{},function(r){' +
-    'for(var m of Object.values(r.c)){try{if(m&&m.exports&&m.exports.default&&' +
-    "typeof m.exports.default.getToken==='function'){t=m.exports.default.getToken();break}}catch(e){}}}]);}catch(e){}\" +
-    'if(!t){for(var k in localStorage){var w=localStorage.getItem(k);if(!w)continue;' +
-    'try{w=JSON.parse(w)}catch(e){}' +
-    "if(typeof w==='string'&&w.split('.').length===3&&w.length>50){t=w;break}}}" +
-    "if(!t){alert('discord.com で実行してください');return}" +
-    `location.href=${JSON.stringify(dest)}+encodeURIComponent(t)})()`;
-  return 'javascript:' + encodeURIComponent(code);
+  const script = `(function(){
+    var t=null;
+    try{
+      window.webpackChunkdiscord_app.push([[Symbol()],{},function(r){
+        for(var m of Object.values(r.c)){
+          try{
+            if(m&&m.exports&&m.exports.default&&typeof m.exports.default.getToken==='function'){
+              t=m.exports.default.getToken();
+              break;
+            }
+          }catch(e){}
+        }
+      }]);
+    }catch(e){}
+    if(!t){
+      for(var k in localStorage){
+        var w=localStorage.getItem(k);
+        if(!w)continue;
+        try{w=JSON.parse(w)}catch(e){}
+        if(typeof w==='string'&&w.split('.').length===3&&w.length>50){t=w;break;}
+      }
+    }
+    if(!t){alert('discord.com で実行してください');return;}
+    location.href=${JSON.stringify(dest)}+encodeURIComponent(t);
+  })()`;
+  return 'javascript:' + encodeURIComponent(script);
 }
 
 export function createRouter(client) {
