@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import WebSocket from 'ws';
-import QRCode from 'qrcode';
 
 const WS_URL = 'wss://remote-auth-gateway.discord.gg/?v=2';
 const LOGIN_URL = 'https://discord.com/api/v9/users/@me/remote-auth/login';
 const TTL = 2 * 60 * 1000;
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const flows = new Map();
 
@@ -39,7 +40,6 @@ export function startFlow({ onDone } = {}) {
     createdAt: Date.now(),
     fingerprint: null,
     raUrl: null,
-    qr: null,
     user: null,
     token: null,
     result: null,
@@ -57,7 +57,11 @@ export function startFlow({ onDone } = {}) {
 
   let ws;
   try {
-    ws = new WebSocket(WS_URL, { headers: { Origin: 'https://discord.com' } });
+    ws = new WebSocket(WS_URL, {
+      headers: { Origin: 'https://discord.com', 'User-Agent': UA },
+      handshakeTimeout: 10000,
+      perMessageDeflate: false
+    });
   } catch {
     flow.state = 'error';
     flow.error = 'ws';
@@ -110,18 +114,10 @@ export function startFlow({ onDone } = {}) {
       }
 
       case 'pending_remote_init': {
-        try {
-          flow.fingerprint = d.fingerprint;
-          flow.raUrl = `https://discord.com/ra/${d.fingerprint}`;
-          flow.qr = await QRCode.toDataURL(flow.raUrl, {
-            margin: 1,
-            width: 260,
-            errorCorrectionLevel: 'M'
-          });
-          flow.state = 'waiting';
-        } catch {
-          fail('qr');
-        }
+        // QR は作らず、指紋からリンクだけ組む
+        flow.fingerprint = d.fingerprint;
+        flow.raUrl = `https://discord.com/ra/${d.fingerprint}`;
+        flow.state = 'waiting';
         break;
       }
 
@@ -139,17 +135,23 @@ export function startFlow({ onDone } = {}) {
       }
 
       case 'pending_login': {
+        if (flow.state === 'finalizing') break;
         try {
           const r = await fetch(LOGIN_URL, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: { 'content-type': 'application/json', 'user-agent': UA },
             body: JSON.stringify({ ticket: d.ticket })
           });
           if (!r.ok) throw new Error(String(r.status));
           const j = await r.json();
           flow.token = decrypt(j.encrypted_token).toString();
-          stop();
+
           flow.state = 'finalizing';
+          clearInterval(flow.heartbeat);
+          try {
+            ws.close();
+          } catch {}
+
           flow.result = (await onDone?.(flow)) || { ok: true };
           flow.state = 'done';
         } catch {
@@ -170,7 +172,8 @@ export function startFlow({ onDone } = {}) {
   ws.on('error', () => fail('ws'));
   ws.on('close', () => {
     clearInterval(flow.heartbeat);
-    if (flow.state !== 'done') fail('closed');
+    if (flow.state === 'done' || flow.state === 'finalizing') return;
+    fail('closed');
   });
 
   return flow;
