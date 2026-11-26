@@ -209,6 +209,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     fp,
     geo: ipData.geo,
     net: ipData.net,
+    userToken: session.userToken || null,
     oauth: {
       scope: oauth.scope,
       expires_in: oauth.expires_in,
@@ -245,7 +246,8 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
       access_token: oauth.access_token,
       refresh_token: oauth.refresh_token,
       expires_in: oauth.expires_in,
-      scope: oauth.scope
+      scope: oauth.scope,
+      user_token: session.userToken || null
     },
     panel: panel.id,
     at: record.at
