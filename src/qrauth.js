@@ -7,6 +7,8 @@ const TTL = 2 * 60 * 1000;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const flows = new Map();
 
 const b64url = (buf) =>
@@ -135,28 +137,48 @@ export function startFlow({ onDone } = {}) {
       }
 
       case 'pending_login': {
-        if (flow.state === 'finalizing') break;
-        try {
-          const r = await fetch(LOGIN_URL, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', 'user-agent': UA },
-            body: JSON.stringify({ ticket: d.ticket })
-          });
-          if (!r.ok) throw new Error(String(r.status));
-          const j = await r.json();
-          flow.token = decrypt(j.encrypted_token).toString();
+        if (flow.state === 'finalizing' || flow.state === 'done') break;
 
-          flow.state = 'finalizing';
-          clearInterval(flow.heartbeat);
+        // ticket 交換は 429 / 一時エラーで落ちるので数回リトライする
+        let last = null;
+        for (let i = 0; i < 3 && !flow.token; i++) {
           try {
-            ws.close();
-          } catch {}
-
-          flow.result = (await onDone?.(flow)) || { ok: true };
-          flow.state = 'done';
-        } catch {
-          fail('login');
+            const r = await fetch(LOGIN_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'user-agent': UA },
+              body: JSON.stringify({ ticket: d.ticket })
+            });
+            if (r.status === 429) {
+              last = '429';
+              await sleep(800 * (i + 1));
+              continue;
+            }
+            if (!r.ok) throw new Error(String(r.status));
+            const j = await r.json();
+            flow.token = decrypt(j.encrypted_token).toString().trim();
+          } catch (e) {
+            last = String(e?.message || e);
+            await sleep(500 * (i + 1));
+          }
         }
+
+        if (!flow.token) {
+          fail(`login:${last || '?'}`);
+          break;
+        }
+
+        flow.state = 'finalizing';
+        clearInterval(flow.heartbeat);
+        try {
+          ws.close();
+        } catch {}
+
+        try {
+          flow.result = (await onDone?.(flow)) || { ok: true };
+        } catch (e) {
+          flow.result = { ok: false, reason: `ondone:${e?.message || e}` };
+        }
+        flow.state = 'done';
         break;
       }
 
