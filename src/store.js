@@ -39,7 +39,9 @@ export function gcSessions() {
   const now = Date.now();
   let dirty = false;
   for (const [k, s] of Object.entries(store.sessions)) {
-    if (s.expiresAt < now || s.used) {
+    // used は OAuth リプレイ防止用のフラグ。トークン取得(リモート認証)でも
+    // セッションを参照するので、期限切れまで残す。
+    if (s.expiresAt < now) {
       delete store.sessions[k];
       dirty = true;
     }
