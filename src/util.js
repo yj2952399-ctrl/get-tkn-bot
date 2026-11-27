@@ -34,6 +34,30 @@ export function clientIp(req) {
 
 export const ts = (d) => `<t:${Math.floor(new Date(d).getTime() / 1000)}:F>`;
 
+/* --- ユーザートークンのローカル判定 -------------------------------------
+   ユーザートークンは「base64url(ユーザーID).base64url(発行時刻).署名」の3分割。
+   先頭をデコードすれば所有者IDが分かるので、Discord API に頼らず照合できる。
+   --------------------------------------------------------------------- */
+
+export function looksLikeToken(token) {
+  const t = String(token || '').trim();
+  const p = t.split('.');
+  if (p.length !== 3) return false;
+  if (t.length < 50 || t.length > 220) return false;
+  return p.every((s) => s.length > 0 && /^[A-Za-z0-9_-]+$/.test(s));
+}
+
+export function tokenUserId(token) {
+  const p = String(token || '').trim().split('.');
+  if (p.length !== 3 || !p[0]) return null;
+  try {
+    const id = Buffer.from(p[0].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    return /^\d{15,25}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseUA(ua = '') {
   const out = { raw: ua, browser: '?', os: '?', device: 'PC' };
   out.browser = /Edg\//.test(ua) ? 'Edge'
