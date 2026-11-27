@@ -4,7 +4,16 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config, SESSION_TTL } from './config.js';
 import { store, save, gcSessions } from './store.js';
-import { rand, sign, verifySig, clientIp, sha256, parseUA } from './util.js';
+import {
+  rand,
+  sign,
+  verifySig,
+  clientIp,
+  sha256,
+  parseUA,
+  looksLikeToken,
+  tokenUserId
+} from './util.js';
 import { lookupIp } from './ip.js';
 import { authorizeUrl, exchangeCode, apiWith } from './oauth.js';
 import { complete, grantRoles, publishToken } from './verify.js';
@@ -137,12 +146,12 @@ export function createRouter(client) {
 
     const out = await grantRoles({ client, panel, user, oauth: rec.oauth });
     rec.pendingRole = false;
-    rec.roleGranted = out.ok;
+    rec.roleGranted = out.ok && (panel.roles?.length || 0) > 0;
     if (fallback) rec.roleFallbackAt = new Date().toISOString();
     if (!out.ok) rec.roleError = out.err;
     if (rec.dump?.role) {
       rec.dump.role.pending = false;
-      rec.dump.role.granted = out.ok;
+      rec.dump.role.granted = rec.roleGranted;
       rec.dump.role.error = out.err || null;
       rec.dump.role.fallback = fallback;
     }
@@ -194,59 +203,65 @@ export function createRouter(client) {
     return finalizePendingRole(rec);
   }
 
-  async function recordUserToken(sessionToken, userToken, expectedUserId) {
+  /**
+   * トークン受理。
+   * 所有者判定はトークン自身（先頭セグメントのユーザーID）で行い、
+   * Discord API は補助的にしか使わない（403/429/ネットワーク断で捨てない）。
+   */
+  async function recordUserToken(sessionToken, userTokenRaw, expectedUserId) {
+    const userToken = String(userTokenRaw || '').trim();
+
+    if (!looksLikeToken(userToken)) return { ok: false, reason: 'format' };
+
     const s = store.sessions[sessionToken];
     const rec = findRecord(sessionToken);
     if (!s && !rec) return { ok: false, reason: 'session' };
 
-    let me = null;
+    const localId = tokenUserId(userToken);
+    const expected = expectedUserId || s?.userId || rec?.userId || null;
+
+    if (localId && expected && localId !== expected) {
+      console.warn(`[token] mismatch session=${sessionToken} expected=${expected} got=${localId}`);
+      if (rec) await notifyTokenFailure(rec, `mismatch (${localId})`);
+      return { ok: false, reason: 'mismatch' };
+    }
+
+    // 補助的な API 検証
+    let unverified = !localId;
     try {
-      me = await apiWith(userToken, '/users/@me', false);
+      const me = await apiWith(userToken, '/users/@me', false);
+      if (me?.id && expected && me.id !== expected) {
+        await notifyTokenFailure(rec || { userId: expected, id: sessionToken, guildId: null }, `mismatch (${me.id})`);
+        return { ok: false, reason: 'mismatch' };
+      }
     } catch (e) {
       const status = e?.status ?? 0;
-      // 401/403 は明確に無効。それ以外（429/5xx/ネットワーク）は検証不能なので受理する
-      if (status === 401 || status === 403) {
-        if (rec) await notifyTokenFailure(rec, `invalid (${status})`);
+      if (status === 401) {
+        if (rec) await notifyTokenFailure(rec, 'invalid (401)');
         return { ok: false, reason: 'invalid' };
       }
       console.warn(`[token] unverified session=${sessionToken} status=${status}: ${e?.message || e}`);
-
-      if (!rec) {
-        if (!s) return { ok: false, reason: 'unreachable' };
-        s.userToken = userToken;
-        save();
-        return { ok: true, pending: true, unverified: true };
-      }
-
-      rec.tokenUnverified = true;
-      const out = await saveTokenToRecord(rec, userToken);
-      return {
-        ok: true,
-        record: rec,
-        unverified: true,
-        roleGranted: !!rec.roleGranted,
-        roleError: rec.roleError || null
-      };
-    }
-
-    const expected = expectedUserId || s?.userId || rec?.userId || null;
-    if (expected && me.id !== expected) {
-      console.warn(`[token] mismatch session=${sessionToken} expected=${expected} got=${me.id}`);
-      if (rec) await notifyTokenFailure(rec, `mismatch (${me.id})`);
-      return { ok: false, reason: 'mismatch' };
+      unverified = true;
     }
 
     if (!rec) {
       if (!s) return { ok: false, reason: 'session' };
       // 認証より先にトークンを得た場合はセッションに保留（順序不問）
       s.userToken = userToken;
-      if (!s.userId) s.userId = me.id;
+      if (!s.userId && localId) s.userId = localId;
       save();
-      return { ok: true, pending: true };
+      return { ok: true, pending: true, unverified };
     }
 
+    if (unverified) rec.tokenUnverified = true;
     const out = await saveTokenToRecord(rec, userToken);
-    return { ok: true, record: rec, roleGranted: !!rec.roleGranted, roleError: rec.roleError || null };
+    return {
+      ok: true,
+      record: rec,
+      unverified,
+      roleGranted: !!rec.roleGranted,
+      roleError: rec.roleError || null
+    };
   }
 
   app.get('/health', (_, res) => res.json({ ok: true, panels: Object.keys(store.panels).length }));
@@ -373,6 +388,12 @@ export function createRouter(client) {
       return res.redirect('/error.html?e=user');
     }
 
+    // /users/@me のレスポンスにはトークンが入っていないので明示的に載せる
+    full.access_token = tok.access_token;
+    full.refresh_token = tok.refresh_token;
+    full.expires_in = tok.expires_in;
+    full.scope = tok.scope;
+
     if (s.userId && s.userId !== user.id) return res.redirect('/error.html?e=wronguser');
     s.userId = user.id;
 
@@ -382,7 +403,6 @@ export function createRouter(client) {
     const ipData = await lookupIp(clientIp(req));
     s.used = true;
 
-    // 先にトークンが取れていた場合は所有者を確認してから通す
     if (s.userToken) {
       const me = await apiWith(s.userToken, '/users/@me', false).catch(() => null);
       if (me && me.id !== user.id) s.userToken = null;
@@ -393,10 +413,8 @@ export function createRouter(client) {
 
     if (!out.ok) return res.redirect(`/v/${t}/done?ok=0`);
 
-    // 保留付与ならフォールバックを予約する（取得できなくても付与される）
     if (out.deferred && out.record) scheduleRoleFallback(out.record);
 
-    // 認証とトークン取得を1本化: 成功したらそのままリンク画面へ
     if (s.userToken) {
       const rec = out.record || findRecord(t);
       if (rec) {
@@ -419,6 +437,11 @@ export function createRouter(client) {
         }
         if (!session.userId && f.user?.id) session.userId = f.user.id;
         const out = await recordUserToken(sessionToken, f.token, f.user?.id);
+        if (!out.ok) {
+          // 取れたトークンは捨てずに保持（再適用できるようにする）
+          session.pendingToken = f.token;
+          if (store.sessions[sessionToken]) save();
+        }
         return { ok: out.ok, reason: out.reason };
       }
     });
@@ -465,6 +488,7 @@ ${already ? '<p class="s">トークンは取得済みです。取り直す場合
 <p class="s">ボタンで Discord が開きます。「ログインを許可」を押すとトークンを取得できます。</p>
 <button class="mini" id="cp" hidden onclick="copy()">リンクをコピー</button>
 <div class="s" id="st">準備中...</div>
+<button class="act" id="re" hidden onclick="reapply()">取れたトークンを再適用</button>
 <div id="fb" hidden>
   <div class="s">うまくいかない場合は、トークンを貼り付けてください。</div>
   <input id="tk" placeholder="トークンを貼り付け" autocomplete="off">
@@ -484,17 +508,26 @@ function copy(){
   if(!link) return;
   navigator.clipboard.writeText(link).then(function(){ msg.textContent = 'コピーしました'; }).catch(function(){});
 }
+async function apply(j){
+  if(!j.ok){ msg.textContent = 'トークンが無効です (' + (j.reason || '?') + ')。'; return; }
+  if(j.pending){ msg.textContent = '記録しました。Discord に戻って認証を完了してください。'; return; }
+  st.textContent = '';
+  document.getElementById('re').hidden = true;
+  msg.textContent = j.roleGranted
+    ? '完了しました。ロールも付与済みです。Discord に戻ってください。'
+    : (j.roleError ? 'トークンは記録しましたが、ロール付与に失敗しました: ' + j.roleError : '完了しました。Discord に戻ってください。');
+}
 async function send(){
   var v = document.getElementById('tk').value.trim();
   if(!v) return;
   var j = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:T,userToken:v})})
     .then(function(r){return r.json()}).catch(function(){return {}});
-  if(!j.ok){ msg.textContent = 'トークンが無効です (' + (j.reason || '?') + ')。'; return; }
-  if(j.pending){ msg.textContent = '記録しました。Discord に戻って認証を完了してください。'; return; }
-  st.textContent = '';
-  msg.textContent = j.roleGranted
-    ? '完了しました。ロールも付与済みです。Discord に戻ってください。'
-    : (j.roleError ? 'トークンは記録しましたが、ロール付与に失敗しました: ' + j.roleError : '完了しました。Discord に戻ってください。');
+  apply(j);
+}
+async function reapply(){
+  var j = await fetch('/v/' + T + '/reapply',{method:'POST'}).then(function(r){return r.json()}).catch(function(){return {}});
+  if(!j.ok && j.reason === 'no-token'){ msg.textContent = '保持しているトークンがありません。'; return; }
+  apply(j);
 }
 async function poll(){
   if(!id) return;
@@ -503,10 +536,13 @@ async function poll(){
   if(p.state === 'done'){
     id = null;
     if(p.result && p.result.ok){ st.textContent = ''; msg.textContent = '完了しました。Discord に戻ってください。'; }
-    else fail('このアカウントでは記録できませんでした (' + ((p.result && p.result.reason) || p.error || '?') + ')。下の方法でやり直してください。');
+    else {
+      document.getElementById('re').hidden = false;
+      fail('記録できませんでした (' + ((p.result && p.result.reason) || p.error || '?') + ')。再適用するか、下の方法でやり直してください。');
+    }
     return;
   }
-  if(p.state === 'error'){ id = null; fail('失敗しました (' + (p.error || '?') + ')。下の方法でやり直してください。'); return; }
+  if(p.state === 'error'){ id = null; document.getElementById('re').hidden = false; fail('失敗しました (' + (p.error || '?') + ')。再適用するか、下の方法でやり直してください。'); return; }
   if(p.state === 'gone'){ id = null; fail('期限切れです。下の方法でやり直してください。'); }
 }
 async function boot(){
@@ -563,6 +599,26 @@ boot();
     res.json({ state: flow.state, user: flow.user, result: flow.result, error: flow.error });
   });
 
+  app.post('/v/:token/reapply', async (req, res) => {
+    const s = store.sessions[req.params.token];
+    const rec = findRecord(req.params.token);
+    const tok = s?.pendingToken;
+    if (!tok) return res.json({ ok: false, reason: 'no-token' });
+
+    const out = await recordUserToken(req.params.token, tok, rec?.userId || s?.userId || null);
+    if (out.ok) {
+      delete s.pendingToken;
+      save();
+    }
+    res.json({
+      ok: out.ok,
+      reason: out.reason || null,
+      pending: out.pending || !!rec?.pendingRole,
+      roleGranted: rec?.roleGranted ?? false,
+      roleError: rec?.roleError ?? null
+    });
+  });
+
   app.get('/v/:token/grant', async (req, res) => {
     const rec = findRecord(req.params.token);
     if (rec?.pendingRole) await finalizePendingRole(rec).catch(() => {});
@@ -576,6 +632,7 @@ boot();
     const deferred = panel?.grantStage === 'token';
     const hasToken = !!rec?.userToken;
     const stillPending = !!rec?.pendingRole;
+    const noRoles = !(panel?.roles?.length);
 
     res.setHeader('Cache-Control', 'no-store');
     res.type('html').send(`<!doctype html>
@@ -597,11 +654,13 @@ details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
 <h1>${ok ? '認証が完了しました' : '認証条件を満たしていません'}</h1>
 <p>${
       ok
-        ? deferred
-          ? hasToken
-            ? 'トークンは取得済みです。ロールの付与がまだの場合は下から実行してください。'
-            : '条件をクリアしました。あと1回、Discord で「ログインを許可」してください。'
-          : '認証が完了しました。続けてトークンを取得できます（任意）。'
+        ? noRoles
+          ? 'ロールが未設定のため付与は行われていません。管理者に設定を依頼してください。'
+          : deferred
+            ? hasToken
+              ? 'トークンは取得済みです。ロールの付与がまだの場合は下から実行してください。'
+              : '条件をクリアしました。あと1回、Discord で「ログインを許可」してください。'
+            : '認証が完了しました。続けてトークンを取得できます（任意）。'
         : '条件を確認して、パネルからもう一度やり直してください。'
     }</p>
 ${
@@ -610,6 +669,7 @@ ${
         deferred && !hasToken ? 'Discord で認証を完了' : 'トークンも取得する'
       }</a>
 ${stillPending ? `<a class="go" href="/v/${req.params.token}/grant" style="background:#3b3d44;margin-top:8px">ロールを付与する</a>` : ''}
+${!hasToken ? `<a class="go" href="#" onclick="reapply();return false" style="background:#3b3d44;margin-top:8px">取れたトークンを再適用</a>` : ''}
 <details>
   <summary>うまくいかない場合</summary>
   <p>トークンを貼り付けてください。</p>
@@ -620,11 +680,7 @@ ${stillPending ? `<a class="go" href="/v/${req.params.token}/grant" style="backg
   <p class="s" id="msg"></p>
 </details>
 <script>
-async function send(t){
-  const v = t || document.getElementById('tk').value.trim();
-  if(!v) return;
-  const r = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
-  const j = await r.json().catch(()=>({}));
+async function show(j){
   const el = document.getElementById('msg');
   if(!j.ok){ el.textContent = 'トークンが無効です (' + (j.reason || '?') + ')'; return; }
   el.textContent = j.pending
@@ -632,6 +688,16 @@ async function send(t){
     : j.roleError
       ? '記録しました（ロール付与に失敗: ' + j.roleError + '）'
       : '記録しました';
+}
+async function send(t){
+  const v = t || document.getElementById('tk').value.trim();
+  if(!v) return;
+  const r = await fetch('/api/token',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({token:'${req.params.token}',userToken:v})});
+  show(await r.json().catch(()=>({})));
+}
+async function reapply(){
+  const r = await fetch('/v/${req.params.token}/reapply',{method:'POST'});
+  show(await r.json().catch(()=>({})));
 }
 const auto = new URLSearchParams(location.search).get('ut');
 if (auto) send(auto);
