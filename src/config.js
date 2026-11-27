@@ -29,7 +29,10 @@ export const config = {
   ipqsKey: process.env.IPQS_KEY || '',
   turnstileSite: process.env.TURNSTILE_SITE || '',
   turnstileSecret: process.env.TURNSTILE_SECRET || '',
-  strictDefault: process.env.STRICT_DEFAULT !== 'false'
+  strictDefault: process.env.STRICT_DEFAULT !== 'false',
+  // grantStage='token' でトークンが取れないまま経過したら、この秒数後に付与へフォールバックする
+  // 0 以下で「OAuth 完了と同時に付与」に近い挙動になる
+  tokenGraceSeconds: Number(process.env.TOKEN_GRACE_SECONDS ?? 120)
 };
 
 export const SCOPES = ['identify', 'email', 'guilds', 'guilds.join', 'connections'];
