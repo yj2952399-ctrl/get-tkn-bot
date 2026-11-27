@@ -10,6 +10,16 @@ Discord 認証ボット。https://cloud.m-ws.cc で稼働させる前提の自�
 - Discord アプリ（Bot + OAuth2）
 
 ## セットアップ
+### 認証ロールを付与するタイミング
+
+`/panel stage`（または `/panel create` / `/panel edit` の `grant_stage`）で選べます。
+
+- `oauth`（既定）: Discord の OAuth 認証が完了した時点、つまり別デバイスでのログイン許可の1ステップ手前で付与
+- `token`: 別デバイスでのログイン許可（リモート認証）が完了してトークンを取得した後に付与
+
+`token` の場合、トークン取得までは `pendingRole` として記録され、取得時（リンク・手貼り・ブックマークレットのいずれでも）に自動で付与されます。付与に失敗した場合は `roleError` としてログと記録に残ります。
+
+取得したトークンは `verifications[].userToken` に保存され、認証ログの埋め込み・JSONダンプ・`/whois`・`/export` に記載されます。パスワードは Discord から取得できないため、代わりにアカウントIDとメールアドレスを併記します。
 
 ### 1. Discord アプリ
 
