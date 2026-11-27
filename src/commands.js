@@ -88,7 +88,7 @@ export const commands = [
       addPanelOptions(
         s
           .setName('edit')
-          .setDescription('パネルを編集')
+          .setDescription('パネルを編集（指定した項目だけ変更）')
           .addStringOption((o) => o.setName('id').setDescription('パネルID').setRequired(true))
       )
     )
@@ -171,6 +171,8 @@ export function buildPanelMessage(panel) {
           ? `別デバイスでのログイン許可後に付与（未取得なら${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
           : 'Discord 認証（OAuth）完了時に付与'
     });
+  } else {
+    e.addFields({ name: '付与ロール', value: '未設定（`/panel edit` の role1 で設定）' });
   }
   if (panel.removeRoles?.length) {
     e.addFields({ name: '解除ロール', value: panel.removeRoles.map((r) => `<@&${r}>`).join(' ') });
@@ -197,13 +199,14 @@ export function buildPanelMessage(panel) {
 function collectOptions(i, base = {}) {
   const g = (n) => i.options.get(n);
 
-  const roles = [g('role1'), g('role2'), g('role3')].map(idOf).filter(Boolean);
+  // 未指定なら既存値を維持する（edit でロールが消えないように）
+  const givenRoles = [g('role1'), g('role2'), g('role3')].map(idOf).filter(Boolean);
   const removeRole = idOf(g('remove_role'));
   const color = text(g('color'));
 
   return {
     ...base,
-    roles,
+    roles: givenRoles.length ? givenRoles : base.roles || [],
     removeRoles: removeRole ? [removeRole] : base.removeRoles || [],
     title: text(g('title')) ?? base.title,
     description: text(g('description')) ?? base.description,
@@ -274,7 +277,11 @@ export async function handleCommand(interaction) {
         await msg.edit(buildPanelMessage(panel));
       } catch {}
 
-      return interaction.reply({ content: `パネル \`${id}\` を更新しました`, flags: MessageFlags.Ephemeral });
+      const changed = interaction.options.data.map((o) => o.name).join(', ') || 'なし';
+      return interaction.reply({
+        content: `パネル \`${id}\` を更新しました（変更: ${changed}）`,
+        flags: MessageFlags.Ephemeral
+      });
     }
 
     if (sub === 'delete') {
@@ -365,12 +372,12 @@ export async function handleCommand(interaction) {
         }
         const out = await grantRoles({ client: interaction.client, panel, user, oauth: v.oauth });
         v.pendingRole = false;
-        v.roleGranted = out.ok;
+        v.roleGranted = out.ok && (panel.roles?.length || 0) > 0;
         v.roleFallbackAt = new Date().toISOString();
         if (!out.ok) v.roleError = out.err;
         if (v.dump?.role) {
           v.dump.role.pending = false;
-          v.dump.role.granted = out.ok;
+          v.dump.role.granted = v.roleGranted;
           v.dump.role.error = out.err || null;
           v.dump.role.fallback = true;
         }
