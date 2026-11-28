@@ -662,7 +662,7 @@ details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
 <p>${
       ok
         ? noRoles
-          ? 'ロールが未設定のため付与は行われていません。管理者に `/panel edit id:${panel?.id || ''} role1:@ロール` を依頼してください。'
+          ? `ロールが未設定のため付与は行われていません。管理者に「/panel edit id:${panel?.id || ''} role1:@ロール」を依頼してください。`
           : deferred
             ? hasToken
               ? 'トークンは取得済みです。ロールの付与がまだの場合は下から実行してください。'
