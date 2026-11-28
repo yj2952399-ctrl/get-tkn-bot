@@ -41,3 +41,5 @@ openssl rand -base64 48   # SESSION_SECRET
 nano .env
 chmod +x deploy.sh
 ./deploy.sh
+# grantStage='token' でトークンが取れない場合、この秒数後にロール付与へフォールバック
+TOKEN_GRACE_SECONDS=120
