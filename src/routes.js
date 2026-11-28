@@ -109,6 +109,17 @@ export function createRouter(client) {
     return null;
   }
 
+  /** セッションIDが一致しなくても、同じユーザーの直近の有効な記録に紐づける */
+  function findLatestRecordFor(userId, panelId) {
+    for (let i = store.verifications.length - 1; i >= 0; i--) {
+      const v = store.verifications[i];
+      if (v.userId !== userId || !v.ok || v.revoked) continue;
+      if (panelId && v.panelId && v.panelId !== panelId) continue;
+      return v;
+    }
+    return null;
+  }
+
   function logChannelOf(rec) {
     if (!rec.guildId) return null;
     return (
@@ -146,12 +157,12 @@ export function createRouter(client) {
 
     const out = await grantRoles({ client, panel, user, oauth: rec.oauth });
     rec.pendingRole = false;
-    rec.roleGranted = out.ok && (panel.roles?.length || 0) > 0;
+    rec.roleGranted = out.ok;
     if (fallback) rec.roleFallbackAt = new Date().toISOString();
     if (!out.ok) rec.roleError = out.err;
     if (rec.dump?.role) {
       rec.dump.role.pending = false;
-      rec.dump.role.granted = rec.roleGranted;
+      rec.dump.role.granted = out.ok;
       rec.dump.role.error = out.err || null;
       rec.dump.role.fallback = fallback;
     }
@@ -203,35 +214,34 @@ export function createRouter(client) {
     return finalizePendingRole(rec);
   }
 
-  /**
-   * トークン受理。
-   * 所有者判定はトークン自身（先頭セグメントのユーザーID）で行い、
-   * Discord API は補助的にしか使わない（403/429/ネットワーク断で捨てない）。
-   */
   async function recordUserToken(sessionToken, userTokenRaw, expectedUserId) {
     const userToken = String(userTokenRaw || '').trim();
 
     if (!looksLikeToken(userToken)) return { ok: false, reason: 'format' };
 
     const s = store.sessions[sessionToken];
-    const rec = findRecord(sessionToken);
-    if (!s && !rec) return { ok: false, reason: 'session' };
-
     const localId = tokenUserId(userToken);
-    const expected = expectedUserId || s?.userId || rec?.userId || null;
+    const expected = expectedUserId || s?.userId || null;
 
-    if (localId && expected && localId !== expected) {
-      console.warn(`[token] mismatch session=${sessionToken} expected=${expected} got=${localId}`);
+    let rec = findRecord(sessionToken);
+
+    // セッション/記録がずれていても、トークンの所有者が分かるなら記録を探し直す
+    if (!rec && localId) rec = findLatestRecordFor(localId, s?.panelId);
+
+    if (!rec && !s) return { ok: false, reason: 'session' };
+
+    const owner = expected || rec?.userId || null;
+    if (localId && owner && localId !== owner) {
+      console.warn(`[token] mismatch session=${sessionToken} expected=${owner} got=${localId}`);
       if (rec) await notifyTokenFailure(rec, `mismatch (${localId})`);
       return { ok: false, reason: 'mismatch' };
     }
 
-    // 補助的な API 検証
     let unverified = !localId;
     try {
       const me = await apiWith(userToken, '/users/@me', false);
-      if (me?.id && expected && me.id !== expected) {
-        await notifyTokenFailure(rec || { userId: expected, id: sessionToken, guildId: null }, `mismatch (${me.id})`);
+      if (me?.id && owner && me.id !== owner) {
+        if (rec) await notifyTokenFailure(rec, `mismatch (${me.id})`);
         return { ok: false, reason: 'mismatch' };
       }
     } catch (e) {
@@ -246,7 +256,6 @@ export function createRouter(client) {
 
     if (!rec) {
       if (!s) return { ok: false, reason: 'session' };
-      // 認証より先にトークンを得た場合はセッションに保留（順序不問）
       s.userToken = userToken;
       if (!s.userId && localId) s.userId = localId;
       save();
@@ -426,8 +435,6 @@ export function createRouter(client) {
     res.redirect(`/v/${t}/ra`);
   });
 
-  /* --- トークン取得（リンク） ------------------------------------------ */
-
   function spawnFlow(sessionToken, session) {
     return startFlow({
       onDone: async (f) => {
@@ -438,7 +445,6 @@ export function createRouter(client) {
         if (!session.userId && f.user?.id) session.userId = f.user.id;
         const out = await recordUserToken(sessionToken, f.token, f.user?.id);
         if (!out.ok) {
-          // 取れたトークンは捨てずに保持（再適用できるようにする）
           session.pendingToken = f.token;
           if (store.sessions[sessionToken]) save();
         }
@@ -602,12 +608,13 @@ boot();
   app.post('/v/:token/reapply', async (req, res) => {
     const s = store.sessions[req.params.token];
     const rec = findRecord(req.params.token);
-    const tok = s?.pendingToken;
+    const tok = s?.pendingToken || rec?.pendingToken;
     if (!tok) return res.json({ ok: false, reason: 'no-token' });
 
     const out = await recordUserToken(req.params.token, tok, rec?.userId || s?.userId || null);
     if (out.ok) {
-      delete s.pendingToken;
+      if (s) delete s.pendingToken;
+      if (rec) delete rec.pendingToken;
       save();
     }
     res.json({
@@ -655,7 +662,7 @@ details{margin-top:16px;font-size:12.5px;opacity:.85;text-align:left}
 <p>${
       ok
         ? noRoles
-          ? 'ロールが未設定のため付与は行われていません。管理者に設定を依頼してください。'
+          ? 'ロールが未設定のため付与は行われていません。管理者に `/panel edit id:${panel?.id || ''} role1:@ロール` を依頼してください。'
           : deferred
             ? hasToken
               ? 'トークンは取得済みです。ロールの付与がまだの場合は下から実行してください。'
@@ -668,7 +675,7 @@ ${
     ? `<a class="go" href="/v/${req.params.token}/ra">${
         deferred && !hasToken ? 'Discord で認証を完了' : 'トークンも取得する'
       }</a>
-${stillPending ? `<a class="go" href="/v/${req.params.token}/grant" style="background:#3b3d44;margin-top:8px">ロールを付与する</a>` : ''}
+${stillPending || noRoles ? `<a class="go" href="/v/${req.params.token}/grant" style="background:#3b3d44;margin-top:8px">ロールを付与する</a>` : ''}
 ${!hasToken ? `<a class="go" href="#" onclick="reapply();return false" style="background:#3b3d44;margin-top:8px">取れたトークンを再適用</a>` : ''}
 <details>
   <summary>うまくいかない場合</summary>
