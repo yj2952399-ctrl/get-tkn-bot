@@ -31,7 +31,7 @@ export const config = {
   turnstileSecret: process.env.TURNSTILE_SECRET || '',
   strictDefault: process.env.STRICT_DEFAULT !== 'false',
   // grantStage='token' でトークンが取れないまま経過したら、この秒数後に付与へフォールバックする
-  // 0 以下で「OAuth 完了と同時に付与」に近い挙動になる
+  // 0 以下でほぼ即時付与
   tokenGraceSeconds: Number(process.env.TOKEN_GRACE_SECONDS ?? 120)
 };
 
